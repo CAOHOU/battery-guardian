@@ -37,7 +37,7 @@ APP_NAME = "电量守护"
 # 改这里就够了。build_exe.bat 会读这几个常量自动生成 version_info.txt，
 # 让 exe 属性里的「公司 / 版权 / 版本」跟源码保持一致。
 __version__ = "1.0.0"
-__author__ = "YOUR_GITHUB_USERNAME"
+__author__ = "CAOHOU"
 __license__ = "MIT"
 __year__ = "2026"
 REPO_NAME = "battery-guardian"

@@ -276,7 +276,7 @@ battery-guardian/
 
 ## 作者与协议
 
-- **作者**：[@YOUR_GITHUB_USERNAME](https://github.com/YOUR_GITHUB_USERNAME)
+- **作者**：[@CAOHOU](https://github.com/CAOHOU)
 - **协议**：[MIT](LICENSE)
 - **版本**：1.0.0
 
