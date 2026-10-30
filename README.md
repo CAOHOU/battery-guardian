@@ -307,7 +307,7 @@ battery-guardian/
 
 ```python
 __version__ = "1.0.0"
-__author__  = "YOUR_GITHUB_USERNAME"
+__author__  = "CAOHOU"
 __license__ = "MIT"
 ```
 
