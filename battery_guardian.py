@@ -1540,6 +1540,24 @@ def self_test():
     ratio_wear = deep_lg.stats["wear"] / norm_lg.stats["wear"]
     assert abs(ratio_wear - 1.5) < 1e-9, f"深放电折损应为 1.5 倍，实际 {ratio_wear:.3f}"
 
+    # 逃生口：mute() 必须真的把截止时间推到将来（否则用户没法让它安静）
+    class _MuteStub:
+        muted_until = 0.0
+
+        def _close_dialog(self):
+            pass
+
+        def _close_failsafe(self):
+            pass
+
+        def _hide_banner(self):
+            pass
+
+    ms = _MuteStub()
+    App.mute(ms, 30)
+    assert ms.muted_until > time.time() + 29 * 60, \
+        f"静音 30 分钟应把截止时间推到未来，实际 {ms.muted_until - time.time():.0f}s"
+
     for pct, expect in [(90, "calm"), (45, "hint"), (25, "nudge"),
                         (15, "dialog"), (5, "fail_safe")]:
         got = level_for(pct, False, cfg)
