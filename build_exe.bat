@@ -24,13 +24,13 @@ if defined BASEPY goto make_venv
 echo [ERROR] No Python 3 with tkinter found.
 echo Install from https://www.python.org/downloads/
 echo Make sure "tcl/tk and IDLE" is checked in the installer.
-timeout /t 8 >nul
+"%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul
 exit /b 1
 
 :make_venv
 echo [1/4] Creating build venv at .venv-build ...
 %BASEPY% -m venv "%VENV%"
-if not exist "%PY%" echo [ERROR] venv creation failed. & timeout /t 8 >nul & exit /b 1
+if not exist "%PY%" echo [ERROR] venv creation failed. & "%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul & exit /b 1
 
 :have_venv
 "%PY%" -c "import PyInstaller" >nul 2>nul
@@ -40,15 +40,17 @@ echo [2/4] Installing PyInstaller ...
 "%PY%" -m pip install --upgrade pip >nul 2>nul
 "%PY%" -m pip install pyinstaller
 "%PY%" -c "import PyInstaller" >nul 2>nul
-if errorlevel 1 echo [ERROR] PyInstaller install failed. & timeout /t 8 >nul & exit /b 1
+if errorlevel 1 echo [ERROR] PyInstaller install failed. & "%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul & exit /b 1
 
 :gen_meta
 echo [3/4] Generating version_info.txt ...
 "%PY%" gen_version_info.py
-if errorlevel 1 echo [ERROR] gen_version_info.py failed. & timeout /t 8 >nul & exit /b 1
+if errorlevel 1 echo [ERROR] gen_version_info.py failed. & "%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul & exit /b 1
 
 :build
 echo [4/4] Building ...
+rem 先结束正在运行的实例，否则 dist 里的旧 exe 被占用，PyInstaller 覆盖会失败
+taskkill /f /im BatteryGuardian.exe >nul 2>nul
 rem 排除不用的模块：ssl/_hashlib 会带进 libcrypto(约 5MB) + libssl(约 0.8MB)
 "%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name BatteryGuardian ^
@@ -91,7 +93,7 @@ rem 排除不用的模块：ssl/_hashlib 会带进 libcrypto(约 5MB) + libssl(�
   --exclude-module turtledemo ^
   --exclude-module curses ^
   battery_guardian.py
-if errorlevel 1 echo [ERROR] Build failed. & timeout /t 8 >nul & exit /b 1
+if errorlevel 1 echo [ERROR] Build failed. & "%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul & exit /b 1
 
 echo.
 echo Done.  dist\BatteryGuardian.exe

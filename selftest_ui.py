@@ -71,7 +71,8 @@ def make_app(root, pct, dock):
 
 def teardown(app):
     app._alive = False
-    for w in (app.hud, app.dialog, app.failsafe_win, app.banner, app.ledger_win):
+    for w in (app.hud, app.dialog, app.failsafe_win, app.banner,
+              app.ledger_win, app.about_win):
         if w is not None:
             try:
                 w.destroy()
@@ -90,7 +91,7 @@ def run(root, pct, dock):
     stage(f"电量 {pct}% / 停靠 {dock}")
     check("贴边无缝隙", edge_gap(app) == 0, f"gap={edge_gap(app)}")
     check("初始为展开", not app.collapsed)
-    check("宽度为完整宽度", app.hud_w > app.px(200), f"w={app.hud_w}")
+    check("宽度为完整宽度", app.hud_w > app.px(150), f"w={app.hud_w}")
 
     stage("收起")
     can = app._can_collapse()
@@ -141,9 +142,32 @@ def run(root, pct, dock):
     pump(root, 0.2)
 
 
+def run_desktop(root):
+    """台式机：没有电池时不能出现 -1%，也不该显示「连续 N 天」。"""
+    app = make_app(root, 50, "right")
+    pump(root, 0.3)
+
+    stage("台式机（无电池）")
+    app.power = {"ac": True, "pct": None, "secs": None,
+                 "charging": False, "has_battery": False}
+    app.level = "ac"
+    app.render_hud()
+    pump(root, 0.2)
+
+    texts = [app.canvas.itemcget(i, "text")
+             for i in app.canvas.find_all() if app.canvas.type(i) == "text"]
+    check("不出现 -1%", not any("-1" in t for t in texts), str(texts))
+    check("显示「无电池」", any("无电池" in t for t in texts), str(texts))
+    check("不显示连续天数", not any("连续" in t for t in texts), str(texts))
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def main():
     # 测试写到临时目录，绝不能碰用户真实的 config / stats
     tmp = tempfile.mkdtemp(prefix="bg-test-")
+    bg.DATA_DIR = tmp
     bg.CFG_PATH = os.path.join(tmp, "config.json")
     bg.STATS_PATH = os.path.join(tmp, "stats.json")
     bg.LOG_PATH = os.path.join(tmp, "app.log")
@@ -160,6 +184,7 @@ def main():
     run(root, 80, "right")
     run(root, 80, "left")
     run(root, 20, "right")
+    run_desktop(root)
 
     root.destroy()
 

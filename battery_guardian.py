@@ -115,11 +115,13 @@ DEFAULTS = {
 # ---------------------------------------------------------------- 电源读取
 
 class _SYSTEM_POWER_STATUS(ctypes.Structure):
+    # 这四个字段是 BYTE（无符号）。用 c_byte 会把 255 读成 -1，
+    # 于是"未知电量"被当成 -1%，台式机上就会显示「-1%」。
     _fields_ = [
-        ("ACLineStatus", ctypes.c_byte),
-        ("BatteryFlag", ctypes.c_byte),
-        ("BatteryLifePercent", ctypes.c_byte),
-        ("SystemStatusFlag", ctypes.c_byte),
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
         ("BatteryLifeTime", ctypes.c_uint),
         ("BatteryFullLifeTime", ctypes.c_uint),
     ]
@@ -134,16 +136,24 @@ def read_power():
     st = _SYSTEM_POWER_STATUS()
     if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
         return None
+
+    has_battery = not bool(st.BatteryFlag & 128)      # 128 = No system battery
     pct = None if st.BatteryLifePercent == UNKNOWN else int(st.BatteryLifePercent)
+    if not has_battery:
+        pct = None                                     # 台式机：没有电量可言
+    if pct is not None and not (0 <= pct <= 100):
+        pct = None                                     # 防御：越界一律当未知
+
     secs = None if st.BatteryLifeTime == NO_TIME else int(st.BatteryLifeTime)
     if secs is not None and (secs <= 0 or secs > 48 * 3600):
         secs = None
+
     return {
         "ac": st.ACLineStatus == 1,
         "pct": pct,
         "secs": secs,
-        "charging": bool(st.BatteryFlag & 8),
-        "has_battery": not bool(st.BatteryFlag & 128),
+        "charging": bool(st.BatteryFlag & 8) and has_battery,
+        "has_battery": has_battery,
     }
 
 
@@ -250,7 +260,9 @@ def _save_json(path, data):
 
 
 def load_config():
-    return _load_json(CFG_PATH, DEFAULTS)
+    # 必须给副本：配置文件不存在时若直接返回模块级 DEFAULTS，
+    # App 里对 cfg 的写入会污染全局默认值，后面 default_config() 都会跟着变。
+    return _sanitize_config(_load_json(CFG_PATH, default_config()))
 
 
 def default_stats():
@@ -268,6 +280,73 @@ def default_stats():
 
 def default_config():
     return json.loads(json.dumps(DEFAULTS))
+
+
+def _as_num(v, default, lo=None, hi=None):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if f != f:                      # NaN
+        return default
+    if lo is not None:
+        f = max(lo, f)
+    if hi is not None:
+        f = min(hi, f)
+    return f
+
+
+def _as_bool(v, default):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return default
+
+
+def _sanitize_config(cfg):
+    """把手改坏的 config 拉回可用范围。
+
+    config.json 是文档里让用户直接编辑的，写错一个类型就会在启动时崩，
+    或者在 poll_seconds=0 时变成死循环。这里统一兜住。
+    """
+    try:
+        cfg["capacity_wh"] = _as_num(cfg.get("capacity_wh"), 60.0, 1.0, 1000.0)
+        cfg["kwh_price"] = _as_num(cfg.get("kwh_price"), 0.60, 0.0, 100.0)
+        cfg["battery_price"] = _as_num(cfg.get("battery_price"), 400.0, 0.0, 100000.0)
+        cfg["battery_cycles"] = _as_num(cfg.get("battery_cycles"), 600.0, 1.0, 100000.0)
+        # 下限 1 秒：0 会让 after(0) 变成忙等，CPU 直接跑满
+        cfg["poll_seconds"] = _as_num(cfg.get("poll_seconds"), 5.0, 1.0, 600.0)
+        cfg["fail_safe_countdown"] = int(_as_num(cfg.get("fail_safe_countdown"), 60, 5, 600))
+        cfg["dialog_regrow_seconds"] = _as_num(cfg.get("dialog_regrow_seconds"), 60.0, 5.0, 3600.0)
+        cfg["collapse_lock_below"] = int(_as_num(cfg.get("collapse_lock_below"), 30, 0, 100))
+        cfg["enable_cost_layer"] = _as_bool(cfg.get("enable_cost_layer"), False)
+        cfg["enable_fail_safe"] = _as_bool(cfg.get("enable_fail_safe"), True)
+
+        if cfg.get("dock_edge") not in (None, "left", "right"):
+            cfg["dock_edge"] = "right"
+
+        pos = cfg.get("hud_pos")
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            try:
+                cfg["hud_pos"] = [int(pos[0]), int(pos[1])]
+            except (TypeError, ValueError):
+                cfg["hud_pos"] = None
+        else:
+            cfg["hud_pos"] = None
+
+        th = cfg.get("thresholds")
+        if not isinstance(th, dict):
+            th = {}
+        cfg["thresholds"] = {
+            k: int(_as_num(th.get(k), dv, 0, 100))
+            for k, dv in DEFAULTS["thresholds"].items()
+        }
+        return cfg
+    except Exception:
+        return default_config()
 
 
 def load_stats():
@@ -818,7 +897,12 @@ class App:
         cv.delete("all")
 
         pct = self.power["pct"]
-        pct_txt = f"{pct}%" if pct is not None else "—"
+        if not self.power.get("has_battery", True):
+            pct_txt = "无电池"
+        elif pct is not None:
+            pct_txt = f"{pct}%"
+        else:
+            pct_txt = "—"
         sub = self.sub_text()
         chip = self.chip_text()
 
@@ -836,11 +920,15 @@ class App:
         pct_x = x
         x += w_pct + gap
         sub_x = x
-        x += w_sub + self.px(11)
-        dot_x = x
-        x += self.px(9)
-        chip_x = x
-        x += w_chip
+        x += w_sub
+        if chip:
+            x += self.px(11)
+            dot_x = x
+            x += self.px(9)
+            chip_x = x
+            x += w_chip
+        else:
+            dot_x = chip_x = None
         total = x + pad_x
 
         if abs(total - self.hud_w) > 1:
@@ -863,11 +951,14 @@ class App:
                          self.hud_w - self.px(1), self.hud_h - self.px(1),
                          *radii, fill=bg, outline=C["border"], width=1)
 
-        self._battery_glyph(glyph_x, cy, pct, accent, self.power["ac"])
+        # 没有电池的机器上别画闪电，否则像"在给空电池充电"
+        show_bolt = self.power["ac"] and self.power.get("has_battery", True)
+        self._battery_glyph(glyph_x, cy, pct, accent, show_bolt)
         cv.create_text(pct_x, cy, text=pct_txt, anchor="w", fill=accent, font=self.f_pct)
         cv.create_text(sub_x, cy, text=sub, anchor="w", fill=fg, font=self.f_txt)
-        cv.create_text(dot_x, cy, text="·", anchor="w", fill=C["faint"], font=self.f_sm)
-        cv.create_text(chip_x, cy, text=chip, anchor="w", fill=C["muted"], font=self.f_sm)
+        if chip:
+            cv.create_text(dot_x, cy, text="·", anchor="w", fill=C["faint"], font=self.f_sm)
+            cv.create_text(chip_x, cy, text=chip, anchor="w", fill=C["muted"], font=self.f_sm)
 
     def _pulse_loop(self):
         if not self._alive:
@@ -882,6 +973,8 @@ class App:
 
     def sub_text(self):
         pct = self.power["pct"]
+        if not self.power.get("has_battery", True):
+            return "已接电" if self.power["ac"] else "未接电"
         if self.power["ac"]:
             return "充电中" if self.power["charging"] else "已接电"
         if pct is None:
@@ -900,6 +993,9 @@ class App:
         return ("系统" + txt) if src == "system" else txt
 
     def chip_text(self):
+        # 没有电池的机器上，"连续 N 天没断电"没有意义
+        if not self.power.get("has_battery", True):
+            return ""
         d = self.stats.get("streak_days", 0)
         return f"连续 {d} 天" if d > 0 else "从今天开始"
 
@@ -1421,8 +1517,9 @@ class App:
 # ---------------------------------------------------------------- 自检
 
 def self_test():
-    cfg = load_config()
-    stats = load_stats()
+    # 用默认值而不是用户真实配置：改过阈值的话断言会假失败
+    cfg = default_config()
+    stats = default_stats()
     lg = Ledger(cfg, stats)
 
     lg.tick(80, False)
@@ -1463,7 +1560,39 @@ def self_test():
     assert App.fmt_duration(None, 90, 96) == "约 1.6 小时", \
         App.fmt_duration(None, 90, 96)
 
-    print("自检：等级判定、速率估算、区间文案、账本全部通过")
+    # 台式机回归：255（未知）必须读成 255，不能是 -1
+    st = _SYSTEM_POWER_STATUS()
+    st.BatteryLifePercent = 255
+    assert st.BatteryLifePercent == 255, f"应为 255，实际 {st.BatteryLifePercent}（字段符号错了）"
+    st.BatteryFlag = 128
+    assert st.BatteryFlag == 128, f"BatteryFlag 应为 128，实际 {st.BatteryFlag}"
+
+    # 无电池机器上的文案
+    stub = type("S", (), {
+        "power": {"ac": True, "pct": None, "secs": None,
+                  "charging": False, "has_battery": False},
+        "stats": {"streak_days": 5},
+    })()
+    assert App.sub_text(stub) == "已接电", App.sub_text(stub)
+    assert App.chip_text(stub) == "", App.chip_text(stub)
+
+    # 配置净化：手改坏的 config 不能让程序崩，也不能变成忙等
+    bad = {
+        "poll_seconds": 0, "capacity_wh": "abc", "dock_edge": "top",
+        "hud_pos": ["x", "y"], "thresholds": {"hint": "80", "nudge": None},
+        "enable_fail_safe": "false", "fail_safe_countdown": -5,
+    }
+    fixed = _sanitize_config(dict(bad))
+    assert fixed["poll_seconds"] >= 1, "poll_seconds 必须 >=1，否则 after(0) 忙等"
+    assert fixed["capacity_wh"] == 60.0, fixed["capacity_wh"]
+    assert fixed["dock_edge"] == "right", fixed["dock_edge"]
+    assert fixed["hud_pos"] is None, fixed["hud_pos"]
+    assert fixed["thresholds"]["hint"] == 80, fixed["thresholds"]
+    assert fixed["thresholds"]["nudge"] == 30, fixed["thresholds"]
+    assert fixed["enable_fail_safe"] is False, '字符串 "false" 不能被当成 True'
+    assert fixed["fail_safe_countdown"] == 5, fixed["fail_safe_countdown"]
+
+    print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、账本全部通过")
 
 
 # ---------------------------------------------------------------- 入口
@@ -1514,7 +1643,11 @@ def main():
     panel = None
     for i, a in enumerate(sys.argv):
         if a == "--demo" and i + 1 < len(sys.argv):
-            demo_pct = int(sys.argv[i + 1])
+            try:
+                demo_pct = int(sys.argv[i + 1])
+            except ValueError:
+                print(f"--demo 需要 0-100 的整数，收到 {sys.argv[i + 1]!r}")
+                return
         if a == "--panel" and i + 1 < len(sys.argv):
             panel = sys.argv[i + 1]
 
