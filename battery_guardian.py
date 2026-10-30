@@ -1592,6 +1592,31 @@ def self_test():
     assert fixed["enable_fail_safe"] is False, '字符串 "false" 不能被当成 True'
     assert fixed["fail_safe_countdown"] == 5, fixed["fail_safe_countdown"]
 
+    # estimate()：噪声门槛必须真的生效，否则会算出"43% 还能撑 43 小时"
+    def _est(power, samples):
+        o = type("E", (), {})()
+        o.power = power
+        o.rate = RateEstimator()
+        base = 100000.0
+        for dt, p in samples:
+            o.rate.add(base - dt, p, False)
+        return o
+
+    noisy = _est({"ac": False, "pct": 43, "secs": None},
+                 [(3600, 44), (600, 43), (0, 43)])       # 60 分钟只掉 1%
+    lo, hi, src = App.estimate(noisy)
+    assert src is None and lo is None, f"1% 降幅应判为噪声，实际 src={src} lo={lo}"
+
+    real = _est({"ac": False, "pct": 43, "secs": None},
+                [(3600, 60), (600, 50), (0, 43)])        # 降幅够大
+    lo, hi, src = App.estimate(real)
+    assert src == "measured", f"应走实测，实际 {src}"
+    assert lo < hi, f"区间应有宽度，实际 ({lo}, {hi})"
+
+    sysonly = _est({"ac": False, "pct": 43, "secs": 600}, [])
+    lo, hi, src = App.estimate(sysonly)
+    assert src == "system" and abs(lo - 10.0) < 1e-6, f"应退回系统估值，实际 {src} {lo}"
+
     print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、账本全部通过")
 
 
