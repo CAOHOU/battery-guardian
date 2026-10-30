@@ -1530,6 +1530,16 @@ def self_test():
           f"/ 比值 {s['ratio']:.1f}x")
     assert s["ratio"] > 5, "电池折损应远高于省下的电费"
 
+    # 深度放电惩罚：同样掉 3%，落在 10% 以下的折损要是 1.5 倍
+    deep_lg = Ledger(default_config(), default_stats())
+    deep_lg.tick(12, False)
+    deep_lg.tick(9, False)
+    norm_lg = Ledger(default_config(), default_stats())
+    norm_lg.tick(32, False)
+    norm_lg.tick(29, False)
+    ratio_wear = deep_lg.stats["wear"] / norm_lg.stats["wear"]
+    assert abs(ratio_wear - 1.5) < 1e-9, f"深放电折损应为 1.5 倍，实际 {ratio_wear:.3f}"
+
     for pct, expect in [(90, "calm"), (45, "hint"), (25, "nudge"),
                         (15, "dialog"), (5, "fail_safe")]:
         got = level_for(pct, False, cfg)
