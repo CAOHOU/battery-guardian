@@ -24,10 +24,11 @@ import os
 import sys
 import time
 import subprocess
+import tempfile
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import deque
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # ---------------------------------------------------------------- 基础路径
 
@@ -306,6 +307,18 @@ def _as_bool(v, default):
     return default
 
 
+def minutes_until_morning(now=None, hour=7):
+    """到「明早」几点，返回分钟数。
+
+    原来右键菜单写死 mute(480)，那是 8 小时，不是「明早」——
+    凌晨 1 点用它是 9 点，晚上 11 点用它是第二天 7 点，纯属巧合。
+    """
+    now = datetime.now() if now is None else now
+    today_target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    target = today_target if today_target > now else today_target + timedelta(days=1)
+    return max(1, int(round((target - now).total_seconds() / 60.0)))
+
+
 def _sanitize_config(cfg):
     """把手改坏的 config 拉回可用范围。
 
@@ -324,6 +337,9 @@ def _sanitize_config(cfg):
         cfg["collapse_lock_below"] = int(_as_num(cfg.get("collapse_lock_below"), 30, 0, 100))
         cfg["enable_cost_layer"] = _as_bool(cfg.get("enable_cost_layer"), False)
         cfg["enable_fail_safe"] = _as_bool(cfg.get("enable_fail_safe"), True)
+        # pinned 是唯一漏净化的下游字段：手写 "false" 会被 bool() 当成 True，
+        # 浮条从此永远不收起，而且没有任何提示。
+        cfg["pinned"] = _as_bool(cfg.get("pinned"), False)
 
         if cfg.get("dock_edge") not in (None, "left", "right"):
             cfg["dock_edge"] = "right"
@@ -340,10 +356,18 @@ def _sanitize_config(cfg):
         th = cfg.get("thresholds")
         if not isinstance(th, dict):
             th = {}
-        cfg["thresholds"] = {
-            k: int(_as_num(th.get(k), dv, 0, 100))
-            for k, dv in DEFAULTS["thresholds"].items()
-        }
+        # 阈值必须满足 hint >= nudge >= dialog >= cost >= fail_safe。
+        # 只把每个值单独 clamp 到 0-100 是不够的：level_for() 是从高优先级往下判，
+        # 一旦 fail_safe 被手改成 50，45% 就会落进保底层 → 高电量直接休眠。
+        # README 明确鼓励用户手改 config.json，所以这是条真实可达的路径。
+        ordered = {}
+        prev = 100
+        for k in ("hint", "nudge", "dialog", "cost", "fail_safe"):
+            v = int(_as_num(th.get(k), DEFAULTS["thresholds"][k], 0, 100))
+            v = min(v, prev)
+            ordered[k] = v
+            prev = v
+        cfg["thresholds"] = ordered
         return cfg
     except Exception:
         return default_config()
@@ -354,6 +378,34 @@ def load_stats():
     if (st.get("today") or {}).get("date") != str(date.today()):
         st["today"] = {"date": str(date.today()), "kwh": 0.0, "wear": 0.0}
     return st
+
+
+def advance_streak(stats, today=None):
+    """推进「连续没让自己断电」的天数。
+
+    抽成模块级纯函数是为了能直接测：原来埋在 App 方法里，
+    把 delta == 1 改成 delta <= 2（断一天也算连续）没有任何测试会红。
+    """
+    today = today or date.today()
+    today_s = str(today)
+    if stats.get("dirty_today") == today_s:
+        return stats
+    if stats.get("last_clean_date") == today_s:
+        return stats
+
+    last = stats.get("last_clean_date")
+    if last is None:
+        stats["streak_days"] = 1
+    else:
+        try:
+            d0 = datetime.strptime(last, "%Y-%m-%d").date()
+            delta = (today - d0).days
+            stats["streak_days"] = (stats.get("streak_days", 0) + 1
+                                    if delta == 1 else 1)
+        except Exception:
+            stats["streak_days"] = 1
+    stats["last_clean_date"] = today_s
+    return stats
 
 
 def log(msg):
@@ -377,6 +429,12 @@ RATE_MIN_SPAN_S = 300  # 至少观察 5 分钟
 # 60 分钟只掉 1%，算出来就是"还能撑 43 小时"。所以要求窗口内至少掉这么多才算数。
 RATE_SHORT_MIN_DROP = 2.0
 RATE_LONG_MIN_DROP = 3.0
+
+# 鼠标离开浮条多久之后自动收起。抽成常量是为了测试能直接引用它，
+# 而不是在测试里也写一个 1.5——那样改坏代码测试会跟着一起错。
+HOVER_COLLAPSE_DELAY_S = 1.5
+HOVER_POLL_MS = 120
+HOVER_GRACE_S = 5.0      # 启动后先别急着藏，让人看清楚
 
 
 class RateEstimator:
@@ -561,7 +619,7 @@ class App:
         self._suppress_geom = False
         self._last_hover = 0.0
         # 启动后先让人看清楚几秒，别一上来就藏起来
-        self._grace_until = time.time() + 5.0
+        self._grace_until = time.time() + HOVER_GRACE_S
         self._alive = True
 
         self.f_pct = tkfont.Font(family=FAMILY, size=12, weight="bold")
@@ -622,7 +680,9 @@ class App:
         self.menu.add_separator()
         self.menu.add_command(label="安静 30 分钟", command=lambda: self.mute(30))
         self.menu.add_command(label="安静 1 小时", command=lambda: self.mute(60))
-        self.menu.add_command(label="安静到明早", command=lambda: self.mute(480))
+        # 不再写死 480 分钟（8 小时），改成真的算到次日 07:00
+        self.menu.add_command(label="安静到明早", command=self._mute_until_morning)
+        self._menu_morning_idx = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_command(label=f"关于 {APP_NAME}", command=self.open_about)
         self.menu.add_command(label="退出", command=self.quit)
@@ -816,28 +876,61 @@ class App:
             return False
         return (x - m <= mx <= x + w + m) and (y - m <= my <= y + h + m)
 
+    def _hover_decision(self, mx, my, now):
+        """鼠标位置 + 时间 → 该做什么：'expand' / 'collapse' / None。
+
+        抽成独立判定是为了能测。selftest 里没法真的移动鼠标，
+        而「鼠标移上去滑出、移开自动收起」是这个工具的核心交互——
+        原来整个 hover 路径零覆盖，把感应带改成 0 像素测试照样全绿。
+        """
+        over = self._pointer_over(mx, my)
+        if self.collapsed:
+            return "expand" if over else None
+        if over:
+            self._last_hover = now
+            return None
+        if (self.dock_edge is not None and not self.pinned
+                and now > self._grace_until
+                and now - self._last_hover > HOVER_COLLAPSE_DELAY_S
+                and self._can_collapse()):
+            return "collapse"
+        return None
+
     def _hover_loop(self):
         if not self._alive:
             return
         try:
             mx, my = self.hud.winfo_pointerxy()
-            over = self._pointer_over(mx, my)
-            now = time.time()
-            if self.collapsed:
-                if over:
-                    self.expand()
-            elif over:
-                self._last_hover = now
-            elif (self.dock_edge is not None and not self.pinned
-                  and now > self._grace_until
-                  and now - self._last_hover > 1.5
-                  and self._can_collapse()):
+            action = self._hover_decision(mx, my, time.time())
+            if action == "expand":
+                self.expand()
+            elif action == "collapse":
                 self.collapse()
         except tk.TclError:
             return
-        self.root.after(120, self._hover_loop)
+        except Exception as e:
+            # 只捕 TclError 是不够的：_can_collapse / collapse 抛任何别的异常
+            # 都会跳过下面的 after 重排，循环从此死掉——浮条静默地再也不收起，
+            # 而且没有日志，用户只会觉得"它今天不收起了"。
+            log(f"hover 循环异常：{e!r}")
+        self.root.after(HOVER_POLL_MS, self._hover_loop)
+
+    def _mute_until_morning(self):
+        self.mute(minutes_until_morning())
 
     def _popup_menu(self, e):
+        # 低电量时把「安静到明早」置灰：电量已经低于 nudge 线还要静音到明早，
+        # 基本等于亲手安排一次硬关机，值得挡一下。
+        try:
+            pct = self.power.get("pct")
+            low = (pct is not None and not self.power.get("ac")
+                   and pct <= int(self.cfg["thresholds"]["nudge"]))
+            self.menu.entryconfigure(
+                self._menu_morning_idx,
+                state=tk.DISABLED if low else tk.NORMAL,
+                label="安静到明早（电量已低，不建议）" if low else "安静到明早")
+        except Exception:
+            pass
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -963,12 +1056,14 @@ class App:
     def _pulse_loop(self):
         if not self._alive:
             return
-        if level_style(self.level)[3]:
-            self.pulse_on = not self.pulse_on
-            try:
+        try:
+            if level_style(self.level)[3]:
+                self.pulse_on = not self.pulse_on
                 self.render_hud()
-            except tk.TclError:
-                return
+        except tk.TclError:
+            return
+        except Exception as e:
+            log(f"脉冲循环异常：{e!r}")
         self.root.after(760, self._pulse_loop)
 
     def sub_text(self):
@@ -1033,7 +1128,8 @@ class App:
         lo_h, hi_h = lo / 60.0, hi / 60.0
         if hi_h - lo_h >= 0.4:
             return f"约 {lo_h:.1f}–{hi_h:.1f} 小时"
-        return f"约 {hi_h:.1f} 小时"
+        # 分钟档取中值，小时档原来取上界，两档口径不一致（小时档偏乐观）
+        return f"约 {(lo + hi) / 2 / 60.0:.1f} 小时"
 
     def minutes_left(self):
         lo, hi, _ = self.estimate()
@@ -1083,11 +1179,14 @@ class App:
 
     def _handle_escalation(self, now):
         pct = self.power["pct"]
-        if pct is None or now < self.muted_until:
+        if pct is None:
             return
         th = self.cfg["thresholds"]
 
-        # L6 保底层
+        # L6 保底层 —— 必须排在静音判断之前。
+        # 静音是「别烦我」，不是「让机器死机」。原来这一层被静音一起短路，
+        # 5% 时点一次「安静到明早」就等于亲手保证硬关机，
+        # L6 存在的全部理由（让最坏结果不是硬关机）正好被逃生口关掉。
         if self.level == "fail_safe":
             if not self._incident_flag:
                 self._incident_flag = True
@@ -1100,6 +1199,10 @@ class App:
             if self.cfg.get("enable_fail_safe") and not self.demo:
                 if self.failsafe_win is None:
                     self._open_failsafe()
+            return
+
+        # 静音只挡 L3 / L4 这类「打扰」，不挡保底层
+        if now < self.muted_until:
             return
 
         # L3 说谎检测对话框
@@ -1479,29 +1582,18 @@ class App:
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 3)}")
 
     def mute(self, minutes):
+        """静音一段时间。
+
+        只关「打扰」类窗口（确认框 / 横幅），**不关保底层**。
+        原来这里会 _close_failsafe()，等于静音顺手把最后一道防线也关了。
+        """
         self.muted_until = time.time() + minutes * 60
         self._close_dialog()
-        self._close_failsafe()
         self._hide_banner()
+        log(f"静音 {minutes} 分钟（保底层仍然生效）")
 
     def _mark_clean_day(self):
-        today = str(date.today())
-        if self.stats.get("dirty_today") == today:
-            return
-        if self.stats.get("last_clean_date") == today:
-            return
-        last = self.stats.get("last_clean_date")
-        if last is None:
-            self.stats["streak_days"] = 1
-        else:
-            try:
-                d0 = datetime.strptime(last, "%Y-%m-%d").date()
-                delta = (date.today() - d0).days
-                self.stats["streak_days"] = (self.stats.get("streak_days", 0) + 1
-                                             if delta == 1 else 1)
-            except Exception:
-                self.stats["streak_days"] = 1
-        self.stats["last_clean_date"] = today
+        advance_streak(self.stats)
 
     def quit(self):
         self._alive = False
@@ -1517,6 +1609,13 @@ class App:
 # ---------------------------------------------------------------- 自检
 
 def self_test():
+    # 自检不能往真实 data/ 写东西（mute() 现在会写日志），统一重定向到临时目录。
+    # 这条是硬要求：审查验收里「data/ 跑完仍为空」。
+    global DATA_DIR, LOG_PATH
+    _tmp = tempfile.mkdtemp(prefix="bg-selftest-")
+    DATA_DIR = _tmp
+    LOG_PATH = os.path.join(_tmp, "app.log")
+
     # 用默认值而不是用户真实配置：改过阈值的话断言会假失败
     cfg = default_config()
     stats = default_stats()
@@ -1543,20 +1642,59 @@ def self_test():
     # 逃生口：mute() 必须真的把截止时间推到将来（否则用户没法让它安静）
     class _MuteStub:
         muted_until = 0.0
+        failsafe_win = None
+
+        def __init__(self):
+            self.closed = []
 
         def _close_dialog(self):
-            pass
+            self.closed.append("dialog")
 
         def _close_failsafe(self):
-            pass
+            self.closed.append("failsafe")
 
         def _hide_banner(self):
-            pass
+            self.closed.append("banner")
 
     ms = _MuteStub()
     App.mute(ms, 30)
     assert ms.muted_until > time.time() + 29 * 60, \
         f"静音 30 分钟应把截止时间推到未来，实际 {ms.muted_until - time.time():.0f}s"
+
+    # P0-1：静音不能连保底层一起关掉。
+    # 原来 mute() 里会 _close_failsafe()，等于「安静到明早」= 亲手保证硬关机。
+    assert "failsafe" not in ms.closed, \
+        f"静音不应关掉保底层，实际关闭了 {ms.closed}"
+    assert "dialog" in ms.closed, "静音应该关掉确认框"
+
+    # P0-1 的行为面：静音期间到 5%，保底层仍然要起来
+    class _EscStub:
+        """只保留 _handle_escalation 需要的字段，用来验证静音与保底层的优先级。"""
+        cfg = default_config()
+        demo = False
+        failsafe_win = None
+        _incident_flag = True          # 跳过计数落盘
+        level = "fail_safe"
+        power = {"ac": False, "pct": 5, "secs": None,
+                 "charging": False, "has_battery": True}
+
+        def __init__(self):
+            self.muted_until = time.time() + 3600
+            self.opened = 0
+
+        def _open_failsafe(self):
+            self.opened += 1
+
+    es = _EscStub()
+    App._handle_escalation(es, time.time())
+    assert es.opened == 1, "静音期间到 5% 必须仍然弹出保底层，实际没有弹"
+
+    # 反过来：静音期间 L3 确认框不该弹（静音本来就是为了别打扰）
+    es2 = _EscStub()
+    es2.level = "dialog"
+    es2.opened = 0
+    App._handle_escalation(es2, time.time())
+    assert es2.opened == 0, "静音期间不该触发保底层"
 
     for pct, expect in [(90, "calm"), (45, "hint"), (25, "nudge"),
                         (15, "dialog"), (5, "fail_safe")]:
@@ -1623,6 +1761,54 @@ def self_test():
     assert fixed["enable_fail_safe"] is False, '字符串 "false" 不能被当成 True'
     assert fixed["fail_safe_countdown"] == 5, fixed["fail_safe_countdown"]
 
+    # P0-2：阈值必须保持 hint >= nudge >= dialog >= cost >= fail_safe。
+    # 只把每个值单独 clamp 到 0-100 不够：fail_safe 手改成 50 时，
+    # level_for() 从高优先级往下判，45% 会直接落进保底层 → 高电量自动休眠。
+    bad_th = _sanitize_config({"thresholds": {"hint": 60, "nudge": 30,
+                                              "dialog": 20, "cost": 10,
+                                              "fail_safe": 50}})
+    t = bad_th["thresholds"]
+    assert t["hint"] >= t["nudge"] >= t["dialog"] >= t["cost"] >= t["fail_safe"], t
+    assert level_for(45, False, bad_th) != "fail_safe", \
+        f"阈值乱序不得让 45% 走保底层，实际 {level_for(45, False, bad_th)}"
+
+    # P2-1：pinned 是唯一漏净化的下游字段，手写 "false" 会被 bool() 当成 True
+    for raw in ("false", "off", "no", "0", 0):
+        p = _sanitize_config({"pinned": raw})["pinned"]
+        assert p is False, f"pinned={raw!r} 应净化成 False，实际 {p!r}"
+    assert _sanitize_config({"pinned": "true"})["pinned"] is True
+
+    # 连续天数：断一天必须从头计。delta == 1 改成 <= 2 会让断档也算连续。
+    d0 = date(2026, 10, 30)
+    st = {"streak_days": 5, "last_clean_date": str(d0 - timedelta(days=1))}
+    advance_streak(st, d0)
+    assert st["streak_days"] == 6, f"隔一天应接上，实际 {st['streak_days']}"
+
+    st = {"streak_days": 5, "last_clean_date": str(d0 - timedelta(days=2))}
+    advance_streak(st, d0)
+    assert st["streak_days"] == 1, f"断一天必须重置为 1，实际 {st['streak_days']}"
+
+    st = {"streak_days": 5, "last_clean_date": str(d0)}
+    advance_streak(st, d0)
+    assert st["streak_days"] == 5, "同一天重复调用不应累加"
+
+    st = {"streak_days": 5, "last_clean_date": str(d0 - timedelta(days=1)),
+          "dirty_today": str(d0)}
+    advance_streak(st, d0)
+    assert st["streak_days"] == 5, "当天断过电不应记连续"
+
+    # 「安静到明早」原来写死 480 分钟（8 小时），不是明早
+    m = minutes_until_morning(datetime(2026, 10, 30, 23, 0))
+    assert abs(m - 480) <= 1, f"23:00 → 次日 7:00 应约 480 分钟，实际 {m}"
+    m = minutes_until_morning(datetime(2026, 10, 30, 1, 0))
+    assert abs(m - 360) <= 1, f"01:00 → 7:00 应约 360 分钟，实际 {m}"
+    m = minutes_until_morning(datetime(2026, 10, 30, 6, 30))
+    assert abs(m - 30) <= 1, f"06:30 → 7:00 应约 30 分钟，实际 {m}"
+
+    # 时长文案：小时档要取中值，不能取上界（分钟档本来就是中值，两档口径要一致）
+    assert App.fmt_duration(None, 100, 106) == "约 1.7 小时", \
+        App.fmt_duration(None, 100, 106)
+
     # estimate()：噪声门槛必须真的生效，否则会算出"43% 还能撑 43 小时"
     def _est(power, samples):
         o = type("E", (), {})()
@@ -1648,7 +1834,8 @@ def self_test():
     lo, hi, src = App.estimate(sysonly)
     assert src == "system" and abs(lo - 10.0) < 1e-6, f"应退回系统估值，实际 {src} {lo}"
 
-    print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、账本全部通过")
+    print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、"
+          "阈值顺序、静音不关保底层、连续天数、明早时长、账本全部通过")
 
 
 # ---------------------------------------------------------------- 入口
@@ -1724,6 +1911,12 @@ def main():
     if panel == "ledger":
         root.after(300, app.open_ledger)
     elif panel == "failsafe":
+        # 这条路径绕过了电量判断，直接开保底层窗口；倒计时到 0 会真的调休眠。
+        # 没带 --demo 就等于「看一眼界面，机器睡过去」，所以强制演示模式。
+        if not app.demo:
+            app.demo = True
+            log("--panel failsafe 未带 --demo，已强制演示模式（不会真的休眠）")
+            print("提示：--panel failsafe 未带 --demo，已强制演示模式，不会真的休眠。")
         root.after(300, app._open_failsafe)
     elif panel == "about":
         root.after(300, app.open_about)

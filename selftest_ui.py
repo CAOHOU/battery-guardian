@@ -168,6 +168,157 @@ def run_desktop(root):
     pump(root, 0.2)
 
 
+def run_hover(root):
+    """hover 判定：感应带 / 容差 / 收起等待。
+
+    原来整条 hover 路径零覆盖——测试全程直接调 expand()/collapse()，
+    所以把感应带改成 0 像素、容差改成 0、等待改成 60 秒，测试照样全绿。
+    """
+    app = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("hover 判定")
+
+    sw = app.hud.winfo_screenwidth()
+    tol = app.px(6)
+    cx = app.hud_x + app.hud_w // 2
+    cy = app.hud_y + app.hud_h // 2
+
+    check("命中浮条内部", app._pointer_over(cx, cy))
+    check("容差内仍算悬停", app._pointer_over(app.hud_x - tol + 1, cy), f"tol={tol}")
+    check("超出容差不算悬停",
+          not app._pointer_over(app.hud_x - tol - app.px(5), cy))
+
+    # 收起态：6px 太细，贴边用 px(30) 的感应带
+    app.collapsed = True
+    app.hud_w = app._bar_w()
+    band = app.px(30)
+    check("收起态感应带命中", app._pointer_over(sw - band + 1, cy),
+          f"band={band} x={sw - band + 1}")
+    check("收起态远离边缘不命中",
+          not app._pointer_over(sw - band - app.px(20), cy))
+
+    # 收起等待阈值。这里必须用绝对值（1 秒 / 2 秒），
+    # 不能引用 bg.HOVER_COLLAPSE_DELAY_S —— 那样把常量改成 60 测试也跟着变，永远绿。
+    app.collapsed = False
+    app._grace_until = time.time() - 1
+    now = time.time()
+    app._last_hover = now - 1.0
+    check("离开 1 秒还不收起", app._hover_decision(-100, -100, now) is None)
+    app._last_hover = now - 2.0
+    check("离开 2 秒要收起",
+          app._hover_decision(-100, -100, now) == "collapse")
+
+    # 收起态鼠标进感应带 → 展开
+    app.collapsed = True
+    app.hud_w = app._bar_w()
+    check("收起态进感应带 → 展开",
+          app._hover_decision(sw - 1, cy, now) == "expand")
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_fit(root):
+    """_fit 的尺寸必须含边框 / 标题栏占位，否则内容被裁。"""
+    app = make_app(root, 80, "right")
+    pump(root, 0.3)
+    stage("_fit 尺寸")
+
+    win = tk.Toplevel(root)
+    win.geometry("200x120+60+60")
+    win.update()
+    dw = max(0, win.winfo_rootx() - win.winfo_x())
+    dh = max(0, win.winfo_rooty() - win.winfo_y())
+
+    wrap = tk.Frame(win, width=300, height=80)
+    wrap.pack()
+    win.update_idletasks()
+    req_w, req_h = wrap.winfo_reqwidth(), wrap.winfo_reqheight()
+
+    got = {}
+    orig_center = app._center
+    app._center = lambda w, ww, hh: got.update(w=ww, h=hh)
+    pad_x, pad_y = app.px(24), app.px(20)
+    app._fit(win, wrap, pad_x, pad_y)
+    app._center = orig_center
+
+    exp_w = req_w + 2 * pad_x + dw
+    exp_h = req_h + 2 * pad_y + dh
+    # 若 dw=0，宽度断言就退化成「不含 dw 也成立」，等于白测。先确认可测。
+    check("窗口边框占位可测（dw>0）", dw > 0, f"dw={dw}")
+    check("宽度含边框占位", got.get("w") == exp_w,
+          f"got={got.get('w')} 期望={exp_w} dw={dw}")
+    check("高度含标题栏占位", got.get("h") == exp_h,
+          f"got={got.get('h')} 期望={exp_h} dh={dh}")
+
+    # 真实 _center（selftest_layout 把它整个替换掉，等于零覆盖）
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    app._center(win, 400, 300)
+    win.update()
+    check("水平居中", abs(win.winfo_x() - (sw - 400) // 2) <= 3,
+          f"x={win.winfo_x()} 期望={(sw - 400) // 2}")
+    check("垂直在 1/3 处", abs(win.winfo_y() - max(0, (sh - 300) // 3)) <= 3,
+          f"y={win.winfo_y()} 期望={max(0, (sh - 300) // 3)}")
+
+    win.destroy()
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_slide_frames(root):
+    """收起动画要有中间帧，不能一帧跳到底。"""
+    app = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("收起动画帧数")
+
+    sw = app.hud.winfo_screenwidth()
+    full = app.hud_w
+    lo, hi = sw - full, sw - app._bar_w()
+
+    xs = []
+    orig = app.hud.geometry
+
+    def rec(spec=None):
+        if spec:
+            try:
+                xs.append(int(spec.split("+")[1]))
+            except (IndexError, ValueError):
+                pass
+        return orig(spec)
+
+    app.hud.geometry = rec
+    app.collapse()
+    settle(root, app)
+    app.hud.geometry = orig
+
+    mids = {x for x in xs if lo < x < hi}
+    check("收起过程有足够中间帧", len(mids) >= 5,
+          f"中间帧 {len(mids)} 个")
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_force_expand(root):
+    """危险档位必须强制展开：收起的浮条在 25% 时要自己滑出来。"""
+    app = make_app(root, 25, "right")
+    pump(root, 0.4)
+    stage("危险档位强制展开")
+
+    app.collapsed = True
+    app.hud_w = app._bar_w()
+    app._sync_geometry()
+    check("前置：浮条已收起", app.collapsed and app.hud_w == app._bar_w())
+
+    app.tick()
+    ok = settle(root, app)
+    check("tick 后自动展开", ok and not app.collapsed,
+          f"animating={app._animating} collapsed={app.collapsed}")
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def main():
     # 测试写到临时目录，绝不能碰用户真实的 config / stats
     tmp = tempfile.mkdtemp(prefix="bg-test-")
@@ -190,7 +341,15 @@ def main():
     # 25% 在 collapse_lock_below(30) 以下、又高于弹框阈值(20)：
     # 这样才真正测到"低于锁定阈值不许收起"，而不是被对话框挡住
     run(root, 25, "right", expect_collapse=False)
+    # 边界：正好等于阈值时必须拒绝收起。原来只测 80/25，
+    # 把 `>` 改成 `>=` 两边都仍然通过。
+    run(root, 31, "right", expect_collapse=True)
+    run(root, 30, "right", expect_collapse=False)
     run_desktop(root)
+    run_hover(root)
+    run_fit(root)
+    run_slide_frames(root)
+    run_force_expand(root)
 
     root.destroy()
 
