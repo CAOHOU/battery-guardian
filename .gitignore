@@ -1,0 +1,15 @@
+# 运行时数据：含个人电池使用记录，不提交
+data/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 构建环境
+.venv-build/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]

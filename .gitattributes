@@ -1,0 +1,9 @@
+# 统一换行，避免跨设备 clone 后脚本行为不一致
+* text=auto
+
+# 批处理必须是 CRLF，否则 cmd 解析会出问题
+*.bat text eol=crlf
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.ico binary
