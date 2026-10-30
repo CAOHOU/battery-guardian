@@ -319,6 +319,34 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_demo_no_persist():
+    """演示模式不能往真实 stats/config 写东西。
+
+    之前 demo 版和正式版能双开（互斥名不同），两个进程都写同一个 stats.json，
+    假电量算出来的账本会覆盖真数据。截图看一眼就把统计改掉，很难察觉。
+    """
+    for p in (bg.STATS_PATH, bg.CFG_PATH):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    r = tk.Tk()
+    r.withdraw()
+    r.report_callback_exception = lambda *a: None
+    app = make_app(r, 80, "right")
+    pump(r, 0.3)
+
+    stage("演示模式不落盘")
+    app.tick()
+    pump(r, 0.2)
+    check("tick 后没写 stats.json", not os.path.exists(bg.STATS_PATH))
+
+    app.quit()          # 会销毁自己的 root，之后不能再 pump
+    check("退出后也没写 stats.json", not os.path.exists(bg.STATS_PATH))
+    check("退出后也没写 config.json", not os.path.exists(bg.CFG_PATH))
+
+
 def main():
     # 测试写到临时目录，绝不能碰用户真实的 config / stats
     tmp = tempfile.mkdtemp(prefix="bg-test-")
@@ -350,6 +378,7 @@ def main():
     run_fit(root)
     run_slide_frames(root)
     run_force_expand(root)
+    run_demo_no_persist()
 
     root.destroy()
 

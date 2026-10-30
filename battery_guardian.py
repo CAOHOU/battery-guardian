@@ -1171,7 +1171,10 @@ class App:
 
         self.render_hud()
 
-        if now - self._save_timer > 20:
+        # 演示模式不落盘：假电量算出来的账本会污染真实统计。
+        # 之前 demo 版和正式版能双开（互斥名不同），两个进程都往同一个
+        # stats.json 写，假数据还会覆盖真数据。
+        if not self.demo and now - self._save_timer > 20:
             self._save_timer = now
             _save_json(STATS_PATH, self.stats)
 
@@ -1597,8 +1600,10 @@ class App:
 
     def quit(self):
         self._alive = False
-        _save_json(STATS_PATH, self.stats)
-        _save_json(CFG_PATH, self.cfg)
+        # 演示模式不写盘：否则截个图就把真实统计和窗口位置改掉了
+        if not self.demo:
+            _save_json(STATS_PATH, self.stats)
+            _save_json(CFG_PATH, self.cfg)
         try:
             self.root.quit()
             self.root.destroy()
