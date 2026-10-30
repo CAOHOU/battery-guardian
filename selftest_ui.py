@@ -187,7 +187,9 @@ def main():
 
     run(root, 80, "right")
     run(root, 80, "left")
-    run(root, 20, "right", expect_collapse=False)   # 低于 collapse_lock_below，必须拒绝收起
+    # 25% 在 collapse_lock_below(30) 以下、又高于弹框阈值(20)：
+    # 这样才真正测到"低于锁定阈值不许收起"，而不是被对话框挡住
+    run(root, 25, "right", expect_collapse=False)
     run_desktop(root)
 
     root.destroy()
