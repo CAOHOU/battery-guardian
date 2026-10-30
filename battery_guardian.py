@@ -1560,12 +1560,15 @@ def self_test():
     assert App.fmt_duration(None, 90, 96) == "约 1.6 小时", \
         App.fmt_duration(None, 90, 96)
 
-    # 台式机回归：255（未知）必须读成 255，不能是 -1
-    st = _SYSTEM_POWER_STATUS()
-    st.BatteryLifePercent = 255
-    assert st.BatteryLifePercent == 255, f"应为 255，实际 {st.BatteryLifePercent}（字段符号错了）"
-    st.BatteryFlag = 128
+    # 台式机回归：从原始字节解析，255（未知）必须读成 255，不能是 -1。
+    # 注意要用 from_buffer_copy 而不是给字段赋值——赋值测的是写入，测不出符号
+    # （ctypes 赋值会回绕，改成 c_byte 后断言照样通过，是个假测试）。
+    raw = bytes([1, 128, 255, 0]) + b"\xff" * 4 + b"\xff" * 4   # AC=1, Flag=128, Pct=255
+    st = _SYSTEM_POWER_STATUS.from_buffer_copy(raw)
+    assert st.BatteryLifePercent == 255, \
+        f"应为 255，实际 {st.BatteryLifePercent}（字段符号错了）"
     assert st.BatteryFlag == 128, f"BatteryFlag 应为 128，实际 {st.BatteryFlag}"
+    assert st.BatteryLifeTime == NO_TIME, f"LifeTime 应为 0xFFFFFFFF，实际 {st.BatteryLifeTime}"
 
     # 无电池机器上的文案
     stub = type("S", (), {
