@@ -36,9 +36,24 @@ APP_NAME = "电量守护"
 # 打包成 exe 后 __file__ 指向临时解包目录，配置写在那里会在退出时被删掉。
 # 这是打包后最容易被忽略的坑：源码跑得好好的，换成 exe 就"记不住"设置和账本。
 FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _app_data_root():
+    """找一个放配置的地方。优先 LOCALAPPDATA，别把目录建在用户主目录根下。"""
+    v = os.environ.get("LOCALAPPDATA")
+    if v:
+        return v
+    up = os.environ.get("USERPROFILE")
+    if up:
+        return os.path.join(up, "AppData", "Local")
+    v = os.environ.get("APPDATA")
+    if v:
+        return v
+    return os.path.expanduser("~")
+
+
 if FROZEN:
-    APP_HOME = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                            "BatteryGuardian")
+    APP_HOME = os.path.join(_app_data_root(), "BatteryGuardian")
     RES_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
 else:
     APP_HOME = os.path.dirname(os.path.abspath(__file__))
@@ -740,7 +755,10 @@ class App:
         if abs(total - self.hud_w) > 1:
             self.hud_w = total
             cv.configure(width=self.hud_w)
-            self._sync_geometry()
+
+        # 无条件重新贴边：宽度没变但屏幕/停靠边变了（换分辨率、插拔外接屏）时，
+        # 只在宽度变化里调用会让位置停在旧值，浮条可能留在屏幕外。
+        self._sync_geometry()
 
         cy = self.hud_h // 2
         r = self.px(13)
