@@ -161,6 +161,60 @@ def hibernate():
         return False
 
 
+def acquire_single_instance(name="BatteryGuardian.SingleInstance"):
+    """GUI 只允许跑一个实例。
+
+    两个实例会各自弹确认框、各自倒计时休眠，而且各自算各自的剩余时间——
+    屏幕上就会出现两个互相打架的数字。返回的句柄需要一直持有。
+    """
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.CreateMutexW(None, False, "Local\\" + name)
+        err = ctypes.get_last_error()
+        if not handle:
+            return None
+        if err == 183:          # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(handle)
+            return None
+        return handle
+    except Exception:
+        return None
+
+
+def show_already_running():
+    """已经有实例在跑时的提示：3.5 秒自动关，不需要用户点。"""
+    try:
+        r = tk.Tk()
+        r.withdraw()
+        win = tk.Toplevel(r)
+        win.title(APP_NAME)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=C["surface"])
+        if os.path.exists(ICON_PATH):
+            try:
+                win.iconbitmap(ICON_PATH)
+            except tk.TclError:
+                pass
+
+        tk.Label(win, text=f"{APP_NAME} 已经在运行了",
+                 bg=C["surface"], fg=C["text"],
+                 font=(FAMILY, 12, "bold")).pack(padx=30, pady=(22, 6))
+        tk.Label(win, text="看屏幕右上角的浮条，右键它可以退出。",
+                 bg=C["surface"], fg=C["muted"],
+                 font=(FAMILY, 10)).pack(padx=30, pady=(0, 22))
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
+
+        r.after(3500, r.destroy)
+        r.mainloop()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 配置与统计
 
 def _ensure_dirs():
@@ -234,10 +288,22 @@ def log(msg):
 
 # ---------------------------------------------------------------- 放电速率估算
 
-class RateEstimator:
-    """用实际电量下降速度估算剩余时间，比系统的 BatteryLifeTime 稳。"""
+# 两个观察窗口：短的反映"你现在在干什么"，长的反映"你平时怎么用"。
+# 笔记本负载差 3-5 倍是常态，单点估值必然飘，所以给区间而不是假精度。
+RATE_SHORT_S = 600     # 最近 10 分钟
+RATE_LONG_S = 3600     # 最近 60 分钟
+RATE_MIN_SPAN_S = 300  # 至少观察 5 分钟
 
-    def __init__(self, window_s=1200, min_span_s=150):
+# 电量只有整数百分比，1% 的量化误差足以把速率算飞：
+# 60 分钟只掉 1%，算出来就是"还能撑 43 小时"。所以要求窗口内至少掉这么多才算数。
+RATE_SHORT_MIN_DROP = 2.0
+RATE_LONG_MIN_DROP = 3.0
+
+
+class RateEstimator:
+    """用实际电量下降速度估算剩余时间，比系统的 BatteryLifeTime 更贴近真实。"""
+
+    def __init__(self, window_s=RATE_LONG_S, min_span_s=RATE_MIN_SPAN_S):
         self.samples = deque()
         self.window_s = window_s
         self.min_span_s = min_span_s
@@ -250,16 +316,30 @@ class RateEstimator:
         while self.samples and t - self.samples[0][0] > self.window_s:
             self.samples.popleft()
 
-    def per_min(self):
+    def per_min(self, window_s=None, min_drop=0.0):
+        """返回指定窗口内的平均放电速率（%/分钟）。
+
+        样本不足、或者窗口内降幅小于 min_drop（量化噪声）时返回 None。
+        """
         if len(self.samples) < 2:
             return None
-        t0, p0 = self.samples[0]
         t1, p1 = self.samples[-1]
+        span_limit = window_s if window_s else self.window_s
+        cutoff = t1 - span_limit
+
+        t0 = p0 = None
+        for t, p in self.samples:
+            if t >= cutoff:
+                t0, p0 = t, p
+                break
+        if t0 is None or t0 == t1:
+            return None
+
         span = t1 - t0
         if span < self.min_span_s:
             return None
         drop = p0 - p1
-        if drop <= 0:
+        if drop < min_drop:
             return None
         return drop / (span / 60.0)
 
@@ -812,24 +892,58 @@ class App:
             return "现在插"
         if self.level == "nudge":
             return "建议现在接电"
-        m = self.minutes_left()
-        return f"约 {m} 分钟" if m is not None else "估算中"
+        lo, hi, src = self.estimate()
+        if lo is None:
+            return "估算中"
+        txt = self.fmt_duration(lo, hi)
+        # 系统估值和自己测的不是一回事，得标出来，否则两个实例看起来在互相打架
+        return ("系统" + txt) if src == "system" else txt
 
     def chip_text(self):
         d = self.stats.get("streak_days", 0)
         return f"连续 {d} 天" if d > 0 else "从今天开始"
 
-    def minutes_left(self):
+    def estimate(self):
+        """剩余时间区间。
+
+        返回 (lo_min, hi_min, source)：
+          measured —— 用最近 10 分钟和 1 小时的实测放电速率分别外推
+          system   —— 样本还不够，退回 Windows 自己的 BatteryLifeTime
+          None     —— 什么都没有
+        """
         pct = self.power["pct"]
         if pct is None:
-            return None
-        r = self.rate.per_min()
-        if r and r > 0:
-            return max(0, int(round(pct / r)))
+            return None, None, None
+
+        rates = [r for r in (self.rate.per_min(RATE_SHORT_S, RATE_SHORT_MIN_DROP),
+                             self.rate.per_min(RATE_LONG_S, RATE_LONG_MIN_DROP))
+                 if r and r > 0]
+        if rates:
+            ts = sorted(pct / r for r in rates)
+            return ts[0], ts[-1], "measured"
+
         secs = self.power["secs"]
         if secs:
-            return max(0, int(round(secs / 60.0)))
-        return None
+            m = secs / 60.0
+            return m, m, "system"
+        return None, None, None
+
+    def fmt_duration(self, lo, hi):
+        """把分钟区间写成「约 25–40 分钟」或「约 1.8–2.9 小时」。"""
+        if hi < 60:
+            if hi - lo >= 5:
+                return f"约 {int(round(lo))}–{int(round(hi))} 分钟"
+            return f"约 {int(round((lo + hi) / 2))} 分钟"
+        lo_h, hi_h = lo / 60.0, hi / 60.0
+        if hi_h - lo_h >= 0.4:
+            return f"约 {lo_h:.1f}–{hi_h:.1f} 小时"
+        return f"约 {hi_h:.1f} 小时"
+
+    def minutes_left(self):
+        lo, hi, _ = self.estimate()
+        if lo is None:
+            return None
+        return max(0, int(round((lo + hi) / 2)))
 
     # ------------------------------------------------------------ 主循环
 
@@ -1253,6 +1367,13 @@ class App:
                  anchor="w", justify="left",
                  wraplength=inner_w).pack(fill="x", pady=(self.px(6), 0))
 
+        tk.Label(wrap, text="剩余时间 = 电量 ÷ 耗电速度。用最近 10 分钟和 1 小时各算一次，"
+                            "两者差距大时显示区间——它反映的是「按你刚才的用法还能撑多久」，"
+                            "不是承诺。刚启动时标「系统」的是 Windows 自己的估值。",
+                 bg=C["surface"], fg=C["faint"], font=self.f_sm,
+                 anchor="w", justify="left",
+                 wraplength=inner_w).pack(fill="x", pady=(self.px(12), 0))
+
         self._fit(win, wrap, pad_x, pad_y, inner_w + 2 * pad_x)
 
     # ------------------------------------------------------------ 杂项
@@ -1322,7 +1443,27 @@ def self_test():
     r.add(0, 80, False)
     r.add(120, 78, False)
     assert abs(r.per_min() - 1.0) < 1e-6, "速率估算应为 1%/分钟"
-    print("自检：等级判定、速率估算、账本全部通过")
+
+    # 两个窗口要能分别反映「最近」和「平均」
+    r2 = RateEstimator(min_span_s=60)
+    r2.add(0, 100, False)          # t=0
+    r2.add(2400, 90, False)        # 40 分钟掉了 10% -> 0.25%/min
+    r2.add(3000, 85, False)        # 再 10 分钟掉 5%  -> 0.5%/min
+    short = r2.per_min(RATE_SHORT_S)
+    long_ = r2.per_min(RATE_LONG_S)
+    assert abs(short - 0.5) < 1e-6, f"短窗口应为 0.5%/min，实际 {short}"
+    assert abs(long_ - 0.3) < 1e-6, f"长窗口应为 0.3%/min，实际 {long_}"
+    assert short > long_, "短窗口速率应快于长窗口"
+
+    # 区间文案
+    assert App.fmt_duration(None, 110, 172) == "约 1.8–2.9 小时", \
+        App.fmt_duration(None, 110, 172)
+    assert App.fmt_duration(None, 25, 40) == "约 25–40 分钟", \
+        App.fmt_duration(None, 25, 40)
+    assert App.fmt_duration(None, 90, 96) == "约 1.6 小时", \
+        App.fmt_duration(None, 90, 96)
+
+    print("自检：等级判定、速率估算、区间文案、账本全部通过")
 
 
 # ---------------------------------------------------------------- 入口
@@ -1378,6 +1519,16 @@ def main():
             panel = sys.argv[i + 1]
 
     _ensure_dirs()
+
+    # 单实例：--demo 用独立互斥名，方便正式版还在跑的时候截图
+    mutex_name = "BatteryGuardian.SingleInstance"
+    if demo_pct is not None:
+        mutex_name += ".demo"
+    mutex = acquire_single_instance(mutex_name)
+    if mutex is None:
+        show_already_running()
+        return
+
     root = tk.Tk()
     root.withdraw()
     app = App(root, load_config(), load_stats(), demo_pct=demo_pct)
