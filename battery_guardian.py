@@ -33,6 +33,15 @@ from datetime import date, datetime
 
 APP_NAME = "电量守护"
 
+# ---- 元信息：单一来源 ----------------------------------------------------
+# 改这里就够了。build_exe.bat 会读这几个常量自动生成 version_info.txt，
+# 让 exe 属性里的「公司 / 版权 / 版本」跟源码保持一致。
+__version__ = "1.0.0"
+__author__ = "YOUR_GITHUB_USERNAME"
+__license__ = "MIT"
+__year__ = "2026"
+REPO_NAME = "battery-guardian"
+
 # 打包成 exe 后 __file__ 指向临时解包目录，配置写在那里会在退出时被删掉。
 # 这是打包后最容易被忽略的坑：源码跑得好好的，换成 exe 就"记不住"设置和账本。
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -375,6 +384,7 @@ class App:
         self.failsafe_win = None
         self.failsafe_deadline = 0.0
         self.ledger_win = None
+        self.about_win = None
         self.banner = None
         self.pulse_on = False
         self._esc_timer = None
@@ -455,6 +465,7 @@ class App:
         self.menu.add_command(label="安静 1 小时", command=lambda: self.mute(60))
         self.menu.add_command(label="安静到明早", command=lambda: self.mute(480))
         self.menu.add_separator()
+        self.menu.add_command(label=f"关于 {APP_NAME}", command=self.open_about)
         self.menu.add_command(label="退出", command=self.quit)
 
         self._drag_off = (0, 0)
@@ -1148,6 +1159,41 @@ class App:
                 pass
         self.banner = None
 
+    # ------------------------------------------------------------ 关于
+
+    def open_about(self):
+        if self.about_win is not None and self.about_win.winfo_exists():
+            self.about_win.lift()
+            return
+        win = tk.Toplevel(self.root)
+        self.about_win = win
+        win.title(f"关于 {APP_NAME}")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=C["surface"])
+        self._set_icon(win)
+
+        inner_w = self.px(340)
+        pad_x, pad_y = self.px(24), self.px(20)
+        wrap = tk.Frame(win, bg=C["surface"])
+        wrap.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
+
+        tk.Label(wrap, text=APP_NAME, bg=C["surface"], fg=C["text"],
+                 font=self.f_title, anchor="w").pack(fill="x")
+        tk.Label(wrap, text=f"版本 {__version__}", bg=C["surface"], fg=C["faint"],
+                 font=self.f_sm, anchor="w").pack(fill="x", pady=(self.px(4), 0))
+        tk.Label(wrap, text="把「忘记插电」从一次可以被点掉的提醒，\n变成一次必须做的动作。",
+                 bg=C["surface"], fg=C["muted"], font=self.f_txt, anchor="w",
+                 justify="left").pack(fill="x", pady=(self.px(16), 0))
+        tk.Label(wrap, text=f"{__license__} License · © {__year__} {__author__}",
+                 bg=C["surface"], fg=C["text"], font=self.f_sm,
+                 anchor="w").pack(fill="x", pady=(self.px(16), 0))
+        tk.Label(wrap, text=f"github.com/{__author__}/{REPO_NAME}",
+                 bg=C["surface"], fg=C["faint"], font=self.f_sm,
+                 anchor="w").pack(fill="x", pady=(self.px(4), 0))
+
+        self._fit(win, wrap, pad_x, pad_y, inner_w + 2 * pad_x)
+
     # ------------------------------------------------------------ 电费账本
 
     def open_ledger(self):
@@ -1339,6 +1385,8 @@ def main():
         root.after(300, app.open_ledger)
     elif panel == "failsafe":
         root.after(300, app._open_failsafe)
+    elif panel == "about":
+        root.after(300, app.open_about)
     root.mainloop()
 
 

@@ -5,6 +5,7 @@ data/
 build/
 dist/
 *.spec
+version_info.txt
 
 # 构建环境
 .venv-build/

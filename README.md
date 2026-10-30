@@ -102,7 +102,8 @@ pythonw battery_guardian.py
 
 - **目标平台**：Windows 10 / 11 **x64**。ARM64 和 32 位不支持——PyInstaller 打的是本机架构，换架构要重新打。
 - **无需 Python**：解释器、tkinter、Tcl/Tk 全部打进 exe。
-- **体积**：实测 **11.7 MB**（单文件，Python 3.14 + tkinter）。
+- **体积**：实测 **8.5 MB**（单文件，Python 3.14 + tkinter）。排除掉不用的 `ssl`/`_hashlib` 等模块后
+  从 11.7 MB 降下来，主要是甩掉了 `libcrypto-3.dll`（5 MB）和 `libssl-3.dll`（0.8 MB）。
 - **单文件代价**：每次启动会解压到 `%TEMP%\_MEIxxxx`，冷启动约 1–2 秒；`--onedir` 更快但要带一个目录。
 - **配置位置**：`%LOCALAPPDATA%\BatteryGuardian\data\`。卸载 = 删 exe + 删这个目录，不留系统痕迹。
 - **未签名**：SmartScreen 会提示"未知发布者"，需点"更多信息 → 仍要运行"；部分杀软会对 PyInstaller 单文件误报，加白名单即可。
@@ -118,7 +119,7 @@ pythonw battery_guardian.py
 
 ### 分发建议
 
-`dist/` 在 `.gitignore` 里，**exe 不进仓库**——每次重新打包都会让仓库膨胀 12MB。
+`dist/` 在 `.gitignore` 里，**exe 不进仓库**——每次重新打包都会让仓库膨胀 8.5 MB。
 推荐做法是把 `BatteryGuardian.exe` 作为 **GitHub Release 附件**发布：
 
 ```bash
@@ -251,6 +252,7 @@ python selftest_layout.py
 | `--demo 15` | 用假电量预览界面，不动真实电源，也不会真休眠 |
 | `--panel ledger` | 直接打开电费账本 |
 | `--panel failsafe` | 直接打开休眠倒计时 |
+| `--panel about` | 直接打开「关于」窗口 |
 | `--once` | 打印一次电池状态就退出 |
 | `--where` | 打印配置与资源路径（排查 exe 用） |
 
@@ -265,12 +267,30 @@ battery-guardian/
   selftest_layout.py    布局矩阵测试（屏幕尺寸 × DPI）
   启动.bat              源码方式启动（自动找带 tkinter 的 Python）
   build_exe.bat         打包成单文件 exe
+  gen_version_info.py   从源码元信息生成 exe 版本资源（打包时自动调用）
   assets/icon.ico       窗口图标
   data/                 运行时生成：config / stats / app.log / cli.log
 ```
 
 ---
 
-## License
+## 作者与协议
 
-MIT
+- **作者**：[@YOUR_GITHUB_USERNAME](https://github.com/YOUR_GITHUB_USERNAME)
+- **协议**：[MIT](LICENSE)
+- **版本**：1.0.0
+
+署名只在一处维护 —— `battery_guardian.py` 顶部的元信息常量：
+
+```python
+__version__ = "1.0.0"
+__author__  = "YOUR_GITHUB_USERNAME"
+__license__ = "MIT"
+```
+
+`build_exe.bat` 打包前会读这几个常量自动生成 `version_info.txt`，所以
+**exe 右键 →「属性 → 详细信息」里的产品名、版权、版本会跟着变**，
+程序里右键浮条 →「关于」也显示同一份信息。
+
+`LICENSE` 里的署名需要手动同步（它不能自动生成），
+`gen_version_info.py` 发现两边不一致时会打印警告。

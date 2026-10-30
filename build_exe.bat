@@ -28,23 +28,69 @@ timeout /t 8 >nul
 exit /b 1
 
 :make_venv
-echo [1/3] Creating build venv at .venv-build ...
+echo [1/4] Creating build venv at .venv-build ...
 %BASEPY% -m venv "%VENV%"
 if not exist "%PY%" echo [ERROR] venv creation failed. & timeout /t 8 >nul & exit /b 1
 
 :have_venv
 "%PY%" -c "import PyInstaller" >nul 2>nul
-if not errorlevel 1 goto build
+if not errorlevel 1 goto gen_meta
 
-echo [2/3] Installing PyInstaller ...
+echo [2/4] Installing PyInstaller ...
 "%PY%" -m pip install --upgrade pip >nul 2>nul
 "%PY%" -m pip install pyinstaller
 "%PY%" -c "import PyInstaller" >nul 2>nul
 if errorlevel 1 echo [ERROR] PyInstaller install failed. & timeout /t 8 >nul & exit /b 1
 
+:gen_meta
+echo [3/4] Generating version_info.txt ...
+"%PY%" gen_version_info.py
+if errorlevel 1 echo [ERROR] gen_version_info.py failed. & timeout /t 8 >nul & exit /b 1
+
 :build
-echo [3/3] Building ...
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name BatteryGuardian --icon "assets\icon.ico" --add-data "assets;assets" battery_guardian.py
+echo [4/4] Building ...
+rem 排除不用的模块：ssl/_hashlib 会带进 libcrypto(约 5MB) + libssl(约 0.8MB)
+"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
+  --name BatteryGuardian ^
+  --icon "assets\icon.ico" ^
+  --add-data "assets;assets" ^
+  --version-file "version_info.txt" ^
+  --exclude-module ssl ^
+  --exclude-module _ssl ^
+  --exclude-module _hashlib ^
+  --exclude-module hashlib ^
+  --exclude-module _decimal ^
+  --exclude-module decimal ^
+  --exclude-module _lzma ^
+  --exclude-module lzma ^
+  --exclude-module _bz2 ^
+  --exclude-module bz2 ^
+  --exclude-module _zstd ^
+  --exclude-module _sqlite3 ^
+  --exclude-module sqlite3 ^
+  --exclude-module _multiprocessing ^
+  --exclude-module multiprocessing ^
+  --exclude-module asyncio ^
+  --exclude-module unittest ^
+  --exclude-module doctest ^
+  --exclude-module pydoc ^
+  --exclude-module pdb ^
+  --exclude-module email ^
+  --exclude-module http ^
+  --exclude-module urllib ^
+  --exclude-module xml ^
+  --exclude-module lib2to3 ^
+  --exclude-module setuptools ^
+  --exclude-module pkg_resources ^
+  --exclude-module pip ^
+  --exclude-module wheel ^
+  --exclude-module test ^
+  --exclude-module tkinter.test ^
+  --exclude-module idlelib ^
+  --exclude-module turtle ^
+  --exclude-module turtledemo ^
+  --exclude-module curses ^
+  battery_guardian.py
 if errorlevel 1 echo [ERROR] Build failed. & timeout /t 8 >nul & exit /b 1
 
 echo.
