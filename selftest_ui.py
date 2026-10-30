@@ -29,6 +29,18 @@ def pump(root, sec=0.7):
         time.sleep(0.015)
 
 
+def settle(root, app, timeout=3.0):
+    """等到滑动动画真的结束，而不是靠固定睡眠。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        root.update()
+        if not app._animating:
+            root.update()
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def check(name, cond, detail=""):
     if cond:
         print(f"  PASS  {name}")
@@ -83,7 +95,8 @@ def run(root, pct, dock):
     stage("收起")
     can = app._can_collapse()
     app.collapse()
-    pump(root, 0.8)
+    ok = settle(root, app)
+    check("收起动画在 3 秒内结束", ok, f"animating={app._animating}")
     if can:
         check("收起后宽度=彩条", app.hud_w == app.px(6), f"w={app.hud_w}")
         check("收起后仍贴边", edge_gap(app) == 0, f"gap={edge_gap(app)}")
@@ -95,7 +108,8 @@ def run(root, pct, dock):
 
     stage("展开")
     app.expand()
-    pump(root, 0.8)
+    ok = settle(root, app)
+    check("展开动画在 3 秒内结束", ok, f"animating={app._animating}")
     check("展开后恢复完整宽度", app.hud_w > app.px(200), f"w={app.hud_w}")
     check("展开后仍贴边", edge_gap(app) == 0, f"gap={edge_gap(app)}")
     check("状态标记为已展开", not app.collapsed)

@@ -321,7 +321,6 @@ def level_style(level):
         "hint": (C["amber_bg"], C["amber"], C["amber"], False),
         "nudge": (C["amber_bg2"], C["amber"], C["amber"], False),
         "dialog": (C["red_bg"], C["red"], C["red"], True),
-        "cost": (C["red_bg"], C["red"], C["red"], True),
         "fail_safe": (C["red_bg2"], C["red"], C["red"], True),
     }.get(level, (C["surface"], C["text"], C["green"], False))
 
@@ -373,6 +372,8 @@ class App:
         self.collapsed = False
         self.free_x = None
         self._animating = False
+        self._anim_gen = 0
+        self._anim_target = None
         self._suppress_geom = False
         self._last_hover = 0.0
         # 启动后先让人看清楚几秒，别一上来就藏起来
@@ -530,18 +531,40 @@ class App:
         return pct > int(self.cfg.get("collapse_lock_below", 30))
 
     def collapse(self):
-        if self.collapsed or not self._can_collapse():
+        if self.collapsed or self._anim_target == "collapsed":
+            return
+        if not self._can_collapse():
             return
         self._slide(expanding=False)
 
     def expand(self):
-        if not self.collapsed or self.dock_edge is None:
+        if self.dock_edge is None:
+            return
+        if not self.collapsed and self._anim_target != "collapsed":
+            return
+        if self._anim_target == "expanded":
             return
         self._slide(expanding=True)
 
     def _slide(self, expanding):
-        if self._animating:
+        """滑出 / 滑回。
+
+        用「代数」而不是「是否正在动画」来判断：新的滑动直接接管旧的，
+        旧动画的后续帧发现代数变了就自己退出。
+
+        同时按「目标状态」去重：hover 循环每 120ms 会调一次 collapse()，
+        而动画要 135ms。如果每次都重启动画，就永远走不完最后一帧，
+        _animating 会卡在 True 再也不收起。已经在滑向同一目标就直接忽略。
+        """
+        if not self._alive:
+            self._animating = False
             return
+
+        target = "expanded" if expanding else "collapsed"
+        if self._animating and self._anim_target == target:
+            return
+        self._anim_target = target
+
         sw = self.hud.winfo_screenwidth()
         bar = self._bar_w()
 
@@ -552,6 +575,8 @@ class App:
             self._suppress_geom = False
 
         full = self.hud_w
+        self._anim_gen += 1
+        gen = self._anim_gen
         self._animating = True
 
         if self.dock_edge == "right":
@@ -564,18 +589,30 @@ class App:
         steps = 9
 
         def step(i):
-            if i > steps:
-                self._animating = False
-                self.collapsed = not expanding
-                self.render_hud()
+            if gen != self._anim_gen or not self._alive:
                 return
-            t = i / float(steps)
-            e = 1 - (1 - t) ** 3
-            self.hud_x = int(round(x_from + (x_to - x_from) * e))
-            self.hud.geometry(f"{full}x{self.hud_h}+{self.hud_x}+{self.hud_y}")
-            self.hud.after(15, lambda: step(i + 1))
+            try:
+                if i > steps:
+                    self._animating = False
+                    self._anim_target = None
+                    self.collapsed = not expanding
+                    self.render_hud()
+                    return
+                t = i / float(steps)
+                e = 1 - (1 - t) ** 3
+                self.hud_x = int(round(x_from + (x_to - x_from) * e))
+                self.hud.geometry(f"{full}x{self.hud_h}+{self.hud_x}+{self.hud_y}")
+                self.hud.after(15, lambda: step(i + 1))
+            except tk.TclError:
+                self._animating = False
+                self._anim_target = None
 
-        self.hud.geometry(f"{full}x{self.hud_h}+{x_from}+{self.hud_y}")
+        try:
+            self.hud.geometry(f"{full}x{self.hud_h}+{x_from}+{self.hud_y}")
+        except tk.TclError:
+            self._animating = False
+            self._anim_target = None
+            return
         step(1)
 
     def _pointer_over(self, mx, my):
@@ -669,7 +706,7 @@ class App:
 
         bg, fg, accent, pulse = level_style(self.level)
         if pulse and self.pulse_on:
-            bg = C["red_bg2"] if self.level in ("dialog", "cost") else "#F2B0B0"
+            bg = C["red_bg2"] if self.level == "dialog" else "#F2B0B0"
 
         cv = self.canvas
         cv.delete("all")
@@ -742,7 +779,7 @@ class App:
             return "电量未知"
         if self.level == "fail_safe":
             return "马上休眠"
-        if self.level in ("dialog", "cost"):
+        if self.level == "dialog":
             return "现在插"
         if self.level == "nudge":
             return "建议现在接电"
@@ -827,7 +864,7 @@ class App:
             return
 
         # L3 说谎检测对话框
-        if self.level in ("dialog", "cost"):
+        if self.level == "dialog":
             if self.dialog is None:
                 self._open_dialog()
             elif now >= self.dialog_next_push:

@@ -102,6 +102,7 @@ pythonw battery_guardian.py
 
 - **目标平台**：Windows 10 / 11 **x64**。ARM64 和 32 位不支持——PyInstaller 打的是本机架构，换架构要重新打。
 - **无需 Python**：解释器、tkinter、Tcl/Tk 全部打进 exe。
+- **体积**：实测 **11.7 MB**（单文件，Python 3.14 + tkinter）。
 - **单文件代价**：每次启动会解压到 `%TEMP%\_MEIxxxx`，冷启动约 1–2 秒；`--onedir` 更快但要带一个目录。
 - **配置位置**：`%LOCALAPPDATA%\BatteryGuardian\data\`。卸载 = 删 exe + 删这个目录，不留系统痕迹。
 - **未签名**：SmartScreen 会提示"未知发布者"，需点"更多信息 → 仍要运行"；部分杀软会对 PyInstaller 单文件误报，加白名单即可。
@@ -114,6 +115,18 @@ pythonw battery_guardian.py
 - **只在主屏工作**。`winfo_screenwidth()` 返回主屏尺寸，多显示器下浮条固定在主屏，不会跟到副屏。
 - 吸附只做左右两边，上下不支持（横条吸上下排版会变形）。
 - 自动收起依赖鼠标位置轮询（120ms 一次），不是系统级 hover 事件。
+
+### 分发建议
+
+`dist/` 在 `.gitignore` 里，**exe 不进仓库**——每次重新打包都会让仓库膨胀 12MB。
+推荐做法是把 `BatteryGuardian.exe` 作为 **GitHub Release 附件**发布：
+
+```bash
+gh release create v1.0.0 dist/BatteryGuardian.exe \
+  --title "v1.0.0" --notes "首个版本"
+```
+
+如果你更希望 exe 直接躺在仓库里，把 `.gitignore` 里的 `dist/` 删掉即可。
 
 ### 验证情况（如实记录）
 
