@@ -84,7 +84,7 @@ def stage(title):
     print(f"\n[{title}]")
 
 
-def run(root, pct, dock):
+def run(root, pct, dock, expect_collapse=True):
     app = make_app(root, pct, dock)
     pump(root, 0.5)
 
@@ -95,6 +95,10 @@ def run(root, pct, dock):
 
     stage("收起")
     can = app._can_collapse()
+    # 这条必须断言，不能靠分支——否则把 collapse_lock_below 改坏也不会报错
+    check(f"收起许可={'允许' if expect_collapse else '拒绝'}"
+          f"（collapse_lock_below 生效）",
+          can is expect_collapse, f"实际 can={can}")
     app.collapse()
     ok = settle(root, app)
     check("收起动画在 3 秒内结束", ok, f"animating={app._animating}")
@@ -183,7 +187,7 @@ def main():
 
     run(root, 80, "right")
     run(root, 80, "left")
-    run(root, 20, "right")
+    run(root, 20, "right", expect_collapse=False)   # 低于 collapse_lock_below，必须拒绝收起
     run_desktop(root)
 
     root.destroy()
