@@ -161,6 +161,19 @@ def run(root, pct, dock, expect_collapse=True):
     check("解除停靠后不再贴边", edge_gap(app) is None)
     check("未停靠时禁止收起", not app._can_collapse())
 
+    stage("右键菜单")
+    # 菜单项用索引定位，插一项就可能错位。这条钉住索引与标签的对应关系。
+    labels = []
+    for i in range(app.menu.index("end") + 1):
+        try:
+            labels.append(app.menu.entrycget(i, "label"))
+        except tk.TclError:
+            labels.append("(sep)")
+    check("菜单里有「开机自启」", "开机自启" in labels, str(labels))
+    check("菜单索引指向「安静到明早」",
+          labels[app._menu_morning_idx].startswith("安静到明早"),
+          f"idx={app._menu_morning_idx} label={labels[app._menu_morning_idx]}")
+
     teardown(app)
     pump(root, 0.2)
 
