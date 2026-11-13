@@ -188,12 +188,12 @@ gh release create v1.0.1 dist/BatteryGuardian.exe \
 **实测（本机）**
 
 - 源码运行：浮条四档状态（已接电 / 45% / 15% / 5%）、确认框、休眠倒计时、账本、L4 横幅
-- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **171 项断言**，连续多轮全通过
+- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **194 项断言**，连续多轮全通过
 - 自动收起：启动 5 秒宽限期后，鼠标不在浮条上会自行收成彩条
 - exe：`--where` / `--once` / `--self-test` 与 GUI 启动、自动收起、确认框、窗口图标
 - **打包流程不碰用户数据**：`selftest_verify.py` 造一个假 app_home 跑一遍 `verify_exe.py`，
   断言 `config.json` / `stats.json` 仍在、真实 `data/` 的 mtime 与文件列表都没变
-- **变异验收**：三套脚本（`_mutcheck_round2/3/4.py`）共 35 项「故意改坏」，全部能被测试抓到
+- **变异验收**：三套脚本（`_mutcheck_round2/3/4.py`）共 43 项「故意改坏」，全部能被测试抓到
 
 **模拟验证（不需要第二台机器）**
 
@@ -237,7 +237,8 @@ gh release create v1.0.1 dist/BatteryGuardian.exe \
    现在 L6 排在静音判断之前，`mute()` 只关确认框和横幅。
 6. **阈值不做顺序校验。** 只把每个阈值单独夹到 0–100，`fail_safe` 手改成 50 时
    45% 就会落进保底层 → 高电量自动休眠。现在按 hint ≥ nudge ≥ dialog ≥ cost ≥ fail_safe
-   逐级夹取。
+   逐级夹取，并给 `fail_safe` 加一个**绝对上限**（15%）：级联只保证顺序不保证量级，
+   五个阈值整体上调时 `fail_safe` 会被「合法」抬到 48%，那就成了高电量休眠。
 7. **打包验证会删掉整个数据目录。** `verify_exe.py` 为了「从干净的 cli.log 开始」，
    对 `%LOCALAPPDATA%\BatteryGuardian\data\cli.log` 做了两次 `dirname` —— 正好是整个
    `BatteryGuardian` 目录，于是每打一次包就把 `config.json` / `stats.json` 一起删掉，
@@ -248,7 +249,8 @@ gh release create v1.0.1 dist/BatteryGuardian.exe \
    开机自启让它变成 7×24 长期运行之后，这从理论风险变成迟早发生。
 9. **`TclError` 是唯一不重排的分支。** 上一版对 `TclError` 直接 `return`，而它恰好是
    注释里写下的「加这个保护的主要动机」（RDP 重连 / 显示器切换）。现在改成记日志后
-   照常重排；真销毁时下面那句 `after` 自己会抛 `TclError` 并被吞掉，循环自然终止。
+   照常重排。真销毁时 `after()` 其实**静默成功、不抛异常**（实测），所以靠连续失败计数兜底，
+   到 `TICK_TCL_GIVE_UP` 次之后才彻底放弃重排。
    顺带加了「连续失败 6 次就让浮条改口说『电量读取失败』」——一个还在动但已经瞎了的
    工具，比直接死掉更难被发现。
 
@@ -403,7 +405,7 @@ python selftest_verify.py
 ```
 battery-guardian/
   battery_guardian.py   全部逻辑，单文件
-  selftest_ui.py        界面冒烟测试（171 项断言）
+  selftest_ui.py        界面冒烟测试（194 项断言）
   selftest_layout.py    布局矩阵测试（12 种屏幕 × DPI）
   selftest_verify.py    打包验证不得碰真实数据
   verify_exe.py         打包后自动验证 exe（build_exe.bat 调用）

@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import subprocess
@@ -422,7 +423,13 @@ def _load_json(path, fallback):
             merged.update(data)
             if "thresholds" in fallback:
                 th = dict(fallback["thresholds"])
-                th.update(data.get("thresholds") or {})
+                # 必须判类型。`th.update("50/30/20/10/8")` 会抛 ValueError，
+                # 被下面那个 except 吞掉 → **整份配置回退 DEFAULTS**。
+                # 后果不是「阈值没生效」那么简单：用户显式写的
+                # enable_fail_safe:false 会被无声改回 true，自动休眠被重新打开。
+                raw_th = data.get("thresholds")
+                if isinstance(raw_th, dict):
+                    th.update(raw_th)
                 merged["thresholds"] = th
             return merged
         return data
@@ -551,6 +558,12 @@ def _sanitize_config(cfg):
             raw = th.get(k)
             v = int(_as_num(raw, DEFAULTS["thresholds"][k], 0, 100))
             clamped = min(v, prev)
+            # 保底层必须有**绝对**上限。级联 min(v, prev) 只保证顺序，不保证量级：
+            # 用户把 5 个阈值整体上调（比如 +40）时，fail_safe 会被「合法」地抬到 48%，
+            # 于是「让提醒早一点」变成「48% 就自动休眠」，而且静音挡不住（L6 在静音之前）。
+            # 60 秒倒计时救不了正在渲染/下载的人。
+            if k == "fail_safe":
+                clamped = min(clamped, FAIL_SAFE_MAX)
             # 静默改写用户配置是最气人的那种 bug：他改了，以为生效了，其实没有
             if clamped != v and os.path.isdir(DATA_DIR):
                 log(f"阈值 {k} 从 {v} 压到 {clamped}"
@@ -561,6 +574,33 @@ def _sanitize_config(cfg):
         return cfg
     except Exception:
         return default_config()
+
+
+@contextlib.contextmanager
+def isolated_data(prefix="bg-test-"):
+    """把 4 个数据路径一起指向独占临时目录，退出时复位并清理。
+
+    **为什么要有这个**：`CFG_PATH` / `STATS_PATH` / `LOG_PATH` 都是模块导入时
+    按真实 `DATA_DIR` 算好的字符串常量。只在某处写 `global DATA_DIR = tmp`
+    不会让它们跟着变——于是「重定向了」的假象下，写操作仍然打到真实文件。
+
+    自检曾经就是这么把用户 11 天的 stats.json 覆盖成 107B 损坏载荷的，
+    而且退出码还是 0、照样打印「全部通过」。
+
+    新增数据路径常量时必须同步改这里，否则契约不完整。
+    """
+    saved = (DATA_DIR, CFG_PATH, STATS_PATH, LOG_PATH)
+    tmp = tempfile.mkdtemp(prefix=prefix)
+    globals()["DATA_DIR"] = tmp
+    globals()["CFG_PATH"] = os.path.join(tmp, "config.json")
+    globals()["STATS_PATH"] = os.path.join(tmp, "stats.json")
+    globals()["LOG_PATH"] = os.path.join(tmp, "app.log")
+    try:
+        yield tmp
+    finally:
+        (globals()["DATA_DIR"], globals()["CFG_PATH"],
+         globals()["STATS_PATH"], globals()["LOG_PATH"]) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def load_stats():
@@ -591,6 +631,11 @@ def load_stats():
 
 
 MAX_HISTORY_DAYS = 21
+
+# 保底层阈值的绝对上限。级联 min(v, prev) 只保证顺序，不保证量级——
+# 用户把 5 个阈值整体上调时，fail_safe 会被「合法」地抬到 48%，
+# 于是「让提醒早一点」变成「48% 就自动休眠」，而静音挡不住（L6 在静音之前）。
+FAIL_SAFE_MAX = 15
 
 # 连续多少次 tick 失败之后，界面上要说实话。
 # 6 次 × 默认 5 秒 = 30 秒：短到用户还在这台机器前，长到不会被一次抖动触发。
@@ -1823,7 +1868,17 @@ class App:
             p = {"ac": False, "pct": self.demo_pct, "secs": None,
                  "charging": False, "has_battery": True}
         else:
-            p = read_power() or self.power
+            p = read_power()
+            if p is None:
+                # 读不到就**别沿用上次读数**。沿用有两个后果：
+                #  1. 不抛异常 ⇒ _tick_fails 不涨 ⇒ 永远不显示「电量读取失败」
+                #  2. 更危险：拿着一个陈旧的 7% 继续升级，甚至开保底层 → 真休眠
+                # pct=None 时 level_for 返回 "calm"，rate.add / ledger.tick 都直接
+                # 返回，升级链自然停在这里。
+                self._tick_fails = getattr(self, "_tick_fails", 0) + 1
+                p = {"ac": False, "pct": None, "secs": None,
+                     "charging": False,
+                     "has_battery": (self.power or {}).get("has_battery", True)}
         self.power = p
 
         now = time.time()
@@ -2399,13 +2454,18 @@ class App:
 # ---------------------------------------------------------------- 自检
 
 def self_test():
-    # 自检不能往真实 data/ 写东西（mute() 现在会写日志），统一重定向到临时目录。
-    # 这条是硬要求：审查验收里「data/ 跑完仍为空」。
-    global DATA_DIR, LOG_PATH
-    _tmp = tempfile.mkdtemp(prefix="bg-selftest-")
-    DATA_DIR = _tmp
-    LOG_PATH = os.path.join(_tmp, "app.log")
+    """自检入口：**先隔离数据**，再跑断言。
 
+    隔离不能交给调用方。自检里有一条 `_save_json(STATS_PATH, {损坏载荷})`，
+    用来验证 `load_stats()` 能不能修好坏数据——如果那条写操作打到真实文件上，
+    就等于把用户账本清空。曾经就是这样：11 天的 stats.json 被覆盖成 107B，
+    而自检退出码还是 0、照样打印「全部通过」。
+    """
+    with isolated_data("bg-selftest-"):
+        _self_test_body()
+
+
+def _self_test_body():
     # 用默认值而不是用户真实配置：改过阈值的话断言会假失败
     cfg = default_config()
     stats = default_stats()
@@ -3252,6 +3312,25 @@ def self_test():
     assert App.chip_text(nb_chip) != "", \
         "缺 has_battery 时不应丢掉连续天数"
 
+    # 阈值整体上调时，保底层必须有**绝对**上限。
+    # 级联 min(v, prev) 只保证顺序：hint=90/nudge=80/dialog=70/cost=60/
+    # fail_safe=48 全部「合法」，于是 48% 就自动休眠，静音还挡不住。
+    up = default_config()
+    up["thresholds"] = {"hint": 90, "nudge": 80, "dialog": 70,
+                        "cost": 60, "fail_safe": 48}
+    up = _sanitize_config(up)
+    assert up["thresholds"]["fail_safe"] <= FAIL_SAFE_MAX, \
+        f"保底层被抬到 {up['thresholds']['fail_safe']}%，会导致高电量休眠"
+
+    # thresholds 结构写错时，不能整份回退 DEFAULTS——
+    # 那会把用户显式关掉的 enable_fail_safe 无声改回 True（自动休眠被重新打开）。
+    _save_json(CFG_PATH, {"thresholds": "50/30/20/10/8",
+                          "enable_fail_safe": False, "poll_seconds": 9})
+    c_bad = load_config()
+    assert c_bad["enable_fail_safe"] is False, \
+        "配置结构写错时不能把 enable_fail_safe 改回 True"
+    assert c_bad["poll_seconds"] == 9.0, c_bad["poll_seconds"]
+    assert isinstance(c_bad["thresholds"], dict), c_bad["thresholds"]
     # stats.json 被改坏时，必须修好结构，而不是让 tick 每 5 秒抛异常、
     # 30 秒后把「数据问题」报成「电量读取失败」（而且永不恢复）。
     _save_json(STATS_PATH, {"days": "not a dict", "streak_days": "x",

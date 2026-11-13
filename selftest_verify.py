@@ -20,6 +20,7 @@ verify_exe.py 的初版为了「从干净的 cli.log 开始」，写了
 ----
     python selftest_verify.py
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -32,6 +33,14 @@ EXE = os.path.join(HERE, "dist", "BatteryGuardian.exe")
 
 KEEP = ("config.json", "stats.json")
 
+
+def _snapshot(d):
+    """逐文件 sha256。比 mtime + 文件名更强：open(path, "w") 原地改写
+    不会改目录 mtime，旧判据会漏检。
+    """
+    return {n: hashlib.sha256(open(os.path.join(d, n), 'rb').read()).hexdigest()
+            for n in sorted(os.listdir(d))
+            if os.path.isfile(os.path.join(d, n))}
 
 def _real_data_dir():
     """应用真正会写数据的目录。
@@ -52,8 +61,11 @@ def main():
     print("=" * 60)
 
     if not os.path.exists(EXE):
-        print("跳过：dist/BatteryGuardian.exe 不存在（先跑 build_exe.bat）")
-        return 0
+        # 按项目「跳过 = 失败」规程：缺产物就是没覆盖，不能算通过。
+        # 原来这里 return 0，于是「没打包的机器」也会看到一条绿色的验收链。
+        print("失败：dist/BatteryGuardian.exe 不存在（先跑 build_exe.bat）")
+        print("     按『跳过 = 失败』规程，缺产物判失败。")
+        return 1
 
     fake = tempfile.mkdtemp(prefix="bg-verify-test-")
     data = os.path.join(fake, "BatteryGuardian", "data")
@@ -72,8 +84,7 @@ def main():
     real_before = None
     skipped = 0
     if os.path.isdir(real_data):
-        real_before = (os.stat(real_data).st_mtime_ns,
-                       sorted(os.listdir(real_data)))
+        real_before = _snapshot(real_data)
     else:
         # 目录不存在时无法比对。这本身不算失败（可能是全新机器），
         # 但必须让「没覆盖」这件事在末行可见，不能混在「全部通过」里。
@@ -115,11 +126,10 @@ def main():
             print(f"  SKIP 真实 data/ 不存在（{real_data}），无法比对")
             print("       这一项**没有覆盖**，别把它算进「全部通过」")
         else:
-            real_after = (os.stat(real_data).st_mtime_ns,
-                          sorted(os.listdir(real_data)))
+            real_after = _snapshot(real_data)
             same = real_after == real_before
             print(("  PASS" if same else "  FAIL") +
-                  f" 真实 data/ 未被触碰（mtime + 文件列表）")
+                  f" 真实 data/ 未被触碰（逐文件 hash）")
             if not same:
                 print(f"  | 运行前 {real_before}")
                 print(f"  | 运行后 {real_after}")
@@ -131,11 +141,11 @@ def main():
     if not ok:
         print("失败")
     elif skipped:
-        # 覆盖不完整时必须说出来，不能混在「全部通过」里
-        print(f"通过（但有 {skipped} 项 SKIP，未完全覆盖）")
+        # 覆盖不完整 = 失败。原来这里返回 0，于是「有一项没验」也能报绿。
+        print(f"失败（有 {skipped} 项 SKIP，按『跳过 = 失败』判失败）")
     else:
         print("全部通过")
-    return 0 if ok else 1
+    return 0 if (ok and not skipped) else 1
 
 
 if __name__ == "__main__":

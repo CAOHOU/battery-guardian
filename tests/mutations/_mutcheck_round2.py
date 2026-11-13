@@ -89,8 +89,25 @@ def check_anchors():
         return False
     return True
 
+def preflight():
+    """未变异的基线必须真的跑通，否则任何「变红」都不可信。
+
+    变异脚本原来把「自检因异常退出」也算作「被捕获」——如果自检根本没跑起来
+    （语法错误、导入失败、依赖缺失），43 项变异会集体报绿。
+    那不是「全捕获」，是「一个都没测」。
+    """
+    rc, out = run([PY, "battery_guardian.py", "--self-test"])
+    ok = (rc == 0 and "日志轮转全部通过" in out)
+    if not ok:
+        print("基线自检未启动或未跑完（属环境错误，禁止计入捕获）")
+        print(f"  rc={rc}  输出尾部: {out.strip()[-200:]}")
+    return ok
+
 def main():
     if not check_anchors():
+        return 1
+    if not preflight():
+        print("基线自检不健康，拒绝继续（否则全部变异都会假绿）")
         return 1
     with open(SRC, encoding="utf-8", newline="") as f:
         orig = f.read()
