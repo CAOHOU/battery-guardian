@@ -156,10 +156,12 @@ def _clean_secs(secs):
 
 
 _CAP_TAG_RE = {
+    # 允许标签带属性（`<FullChargeCapacity unit="mWh">`）。当前 powercfg 不加属性，
+    # 但正则会因为那个 `>` 前面多了空格而整段匹配不上，静默退回 None —— 属未来兼容风险。
     "FullChargeCapacity": re.compile(
-        r"<FullChargeCapacity>\s*([0-9]+(?:\.[0-9]+)?)\s*</FullChargeCapacity>"),
+        r"<FullChargeCapacity(?:\s[^>]*)?>\s*([0-9]+(?:\.[0-9]+)?)\s*</FullChargeCapacity>"),
     "DesignCapacity": re.compile(
-        r"<DesignCapacity>\s*([0-9]+(?:\.[0-9]+)?)\s*</DesignCapacity>"),
+        r"<DesignCapacity(?:\s[^>]*)?>\s*([0-9]+(?:\.[0-9]+)?)\s*</DesignCapacity>"),
 }
 
 
@@ -169,6 +171,10 @@ def _capacity_from_report_xml(xml_text):
     优先 FullChargeCapacity（当前实际满充），退回 DesignCapacity（出厂设计）。
     账本算的是「这次放电实际放出多少电」，所以当前值更贴切。
 
+    **多电池按段累加**：XML 里每块电池一个 `<Battery>` 段。只取第一个的话，
+    两块 40 Wh 的机器会读成 40 Wh（少算一半），而 40 落在 5-300 Wh 的合理性
+    区间里，校验根本拦不住——这种错会静默地把账本数字砍半。
+
     这里刻意**不用 xml.etree**：构建脚本为了减体积排除了整个 xml 包，
     在 exe 里 import 它会失败（而且实测会卡住自检）。字段就两个数字，
     正则足够，还省掉一个依赖。
@@ -176,8 +182,11 @@ def _capacity_from_report_xml(xml_text):
     if not xml_text:
         return None
 
-    def pick(tag):
-        m = _CAP_TAG_RE[tag].search(xml_text)
+    # 没有 <Battery> 段就退化成全文搜索（某些版本或精简报告可能没有分段）
+    blocks = re.findall(r"<Battery>(.*?)</Battery>", xml_text, re.S) or [xml_text]
+
+    def pick(tag, text):
+        m = _CAP_TAG_RE[tag].search(text)
         if not m:
             return None
         try:
@@ -186,17 +195,27 @@ def _capacity_from_report_xml(xml_text):
             return None
         return v if v > 0 else None
 
-    mwh = pick("FullChargeCapacity") or pick("DesignCapacity")
-    if not mwh:
+    total_mwh = 0.0
+    for blk in blocks:
+        mwh = pick("FullChargeCapacity", blk) or pick("DesignCapacity", blk)
+        if mwh:
+            total_mwh += mwh
+    if total_mwh <= 0:
         return None
-    wh = mwh / 1000.0
+
+    wh = total_mwh / 1000.0
     # 笔记本电池实际在 20-150 Wh 之间；超出这个量级说明解析到了别的数字
     if not (5.0 <= wh <= 300.0):
         return None
     return round(wh, 1)
 
 
-def read_battery_capacity_wh(timeout=25):
+# powercfg 的超时。单独提成常量是为了能被断言——它是「读不到容量就静默退回
+# 默认 60Wh」这条退化路径的唯一闸门，改成 0 会让账本永远算错，而原先没有任何测试会红。
+POWERCAP_TIMEOUT = 25
+
+
+def read_battery_capacity_wh(timeout=POWERCAP_TIMEOUT):
     """跑 powercfg 读本机电池容量，读不到返回 None。
 
     用 -xml 而不是默认的 HTML：HTML 是给人看的，本地化之后字段名会变。
@@ -232,6 +251,30 @@ def _ac_from_status(v):
     因为测试从不经过 read_power。抽出来单独喂值。
     """
     return v == 1
+
+
+def should_autofill_capacity(cfg, demo=False):
+    """是否需要在后台读一次真实电池容量。
+
+    只在用户没填过（还是默认 60 Wh）时才读——否则会把他手工填的值覆盖掉。
+    这个判断原先内联在 __init__ 里，没有任何测试覆盖：去掉条件后整套测试全绿，
+    但用户精心填的 capacity_wh 每次启动都会被 60 附近的实测值顶掉。
+    """
+    if demo:
+        return False
+    try:
+        return abs(float(cfg.get("capacity_wh", 0)) - 60.0) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def clamp_tick_dt(now, last):
+    """两次 tick 的间隔，上限 60 秒。
+
+    防的是「休眠 / 挂起几小时后醒来，把整段时间一口气算进今天」——
+    那会让账本的离电时长直接翻几倍，而账本正是这个工具唯一的反馈来源。
+    """
+    return min(60.0, max(0.0, now - last))
 
 
 def _charging_from_flag(flag, has_battery):
@@ -618,6 +661,31 @@ AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "BatteryGuardian"
 
 
+def _resolve_py_launcher(exe=None):
+    """`py.exe` 是启动器（控制台程序），问它真实解释器在哪。
+
+    用 `py -0p` 列出已安装版本，带 `*` 的那行是默认版本。
+    解析失败一律返回 None —— 调用方保持原样（退回 py.exe，最坏只是闪一下黑框），
+    绝不能因为解析出错把自启指向一个不存在的路径，那样开机根本起不来。
+    """
+    exe = exe or sys.executable
+    try:
+        r = subprocess.run([exe, "-0p"], capture_output=True, timeout=10)
+        text = (r.stdout or b"").decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+    for line in text.splitlines():
+        if "*" not in line:
+            continue
+        m = re.search(r"([A-Za-z]:\\[^\r\n]*?python\.exe)", line, re.I)
+        if m:
+            cand = m.group(1).strip()
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
 def _autostart_command():
     """开机自启要执行的命令。
 
@@ -626,9 +694,16 @@ def _autostart_command():
     """
     if FROZEN:
         return f'"{sys.executable}"'
-    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    exe = sys.executable
+    # `py -3 xxx.py` 启动时 sys.executable 是 py.exe（控制台程序），
+    # 它旁边没有 pythonw.exe，直接拼出来的命令会在登录时闪一个黑框。
+    if os.path.basename(exe).lower() == "py.exe":
+        real = _resolve_py_launcher(exe)
+        if real:
+            exe = real
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
     if not os.path.exists(pyw):
-        pyw = sys.executable
+        pyw = exe
     script = os.path.join(APP_HOME, "battery_guardian.py")
     return f'"{pyw}" "{script}"'
 
@@ -888,9 +963,9 @@ class App:
         self._hibernate_failed = False
         self._last_tick = time.time()
 
-        # 账本默认 60Wh 只是占位符，和真机容量能差 40%。第一次跑时后台读一下
+        # 账本默认 60Wh 只是占位符，和真机容量能差 40%。用户没填过时后台读一次
         # 本机真实容量——放线程里，别让 2 秒的 powercfg 卡住启动。
-        if not self.demo and abs(float(self.cfg.get("capacity_wh", 0)) - 60.0) < 1e-6:
+        if should_autofill_capacity(self.cfg, self.demo):
             threading.Thread(target=self._autofill_capacity, daemon=True).start()
 
         # 吸附 / 收起状态
@@ -1230,6 +1305,10 @@ class App:
 
         只改内存里的 cfg，不在这里落盘——落盘交给 quit() / 拖动时的 _save_cfg，
         避免和 tick 的 stats 写入抢同一个文件。
+
+        注意：线程里只允许改**已存在**的键。给 cfg 新增键的话，
+        主线程 json.dump 迭代时可能抛 RuntimeError，被外层 except 吞掉，
+        变成「配置静默不落盘」——用户以为改了，重启就没了。
         """
         try:
             wh = read_battery_capacity_wh()
@@ -1254,6 +1333,12 @@ class App:
         return "normal", "安静到明早"
 
     def _popup_menu(self, e):
+        # 每次弹出都重读真实状态。autostart_var 只在建菜单时初始化一次，
+        # 如果用户在别处改过注册表（或另一个实例改的），菜单会一直说着旧话。
+        try:
+            self.autostart_var.set(autostart_enabled())
+        except Exception:
+            pass
         # 低电量时把「安静到明早」置灰
         try:
             state, label = self._morning_menu_state()
@@ -1472,8 +1557,32 @@ class App:
     # ------------------------------------------------------------ 主循环
 
     def tick(self):
+        """主循环：读电量 → 判等级 → 升级处理 → 重绘 → 排下一次。
+
+        这里必须兜住异常，原因不是「防御式编程」，而是一个具体的失效模式：
+        最后那句 after 是循环唯一的续命动作，任何异常跳过它，循环就永久停止——
+        浮条不再刷新、L3 确认框不再弹、**L6 保底层不再触发**，而且没有任何提示，
+        工具退化成一根装饰条。开机自启让进程变成 7×24 长期运行之后，
+        「跑几天撞上一次」就从理论风险变成了迟早发生：
+        render_hud 的 TclError（RDP / 注销 / 显示器变化）、read_power 的 ctypes 异常、
+        stats 结构被外部改坏，都在这条路径上。
+        """
         if not self._alive:
             return
+        try:
+            self._tick_once()
+        except tk.TclError:
+            # 窗口正在销毁（退出或注销），没必要再排下一次
+            return
+        except Exception as e:
+            log(f"tick 异常：{e!r}")
+        if self._alive:
+            try:
+                self.root.after(int(self.cfg["poll_seconds"] * 1000), self.tick)
+            except tk.TclError:
+                pass
+
+    def _tick_once(self):
         if self.demo_pct is not None:
             p = {"ac": False, "pct": self.demo_pct, "secs": None,
                  "charging": False, "has_battery": True}
@@ -1482,9 +1591,8 @@ class App:
         self.power = p
 
         now = time.time()
-        # 离电时长按两次 tick 的间隔累加。上限 60 秒是为了防止
-        # 休眠/挂起之后醒来，把几小时一口气算进今天。
-        dt = min(60.0, max(0.0, now - self._last_tick))
+        # 离电时长按两次 tick 的间隔累加，上限 60 秒（见 clamp_tick_dt）。
+        dt = clamp_tick_dt(now, self._last_tick)
         self._last_tick = now
         self.rate.add(now, p["pct"], p["ac"])
         self.ledger.tick(p["pct"], p["ac"])
@@ -1515,8 +1623,6 @@ class App:
         if not self.demo and now - self._save_timer > 20:
             self._save_timer = now
             _save_json(STATS_PATH, self.stats)
-
-        self.root.after(int(self.cfg["poll_seconds"] * 1000), self.tick)
 
     def _handle_escalation(self, now):
         pct = self.power["pct"]
@@ -1807,6 +1913,10 @@ class App:
         """休眠失败后的提示窗：不响、不重试、允许关闭。
 
         这一屏是给用户自己动手的——工具已经无能为力，至少别让它变成噪音源。
+
+        刻意用**中性底色 + 红字**，而不是保底层那种整片红底：
+        那个红窗的意思是「马上要断电了，快插电」，这一屏的意思是「我失败了，
+        你自己看着办」。两者用同一种视觉语言，会让人误以为保底层可以被关掉。
         """
         if self.fail_win is not None:
             return
@@ -1815,20 +1925,20 @@ class App:
         win.title("自动休眠失败")
         win.attributes("-topmost", True)
         win.resizable(False, False)
-        win.configure(bg=C["red_bg"])
+        win.configure(bg=C["surface_soft"])
         self._set_icon(win)
         win.protocol("WM_DELETE_WINDOW", self._close_fail_win)
 
-        wrap = tk.Frame(win, bg=C["red_bg"])
+        wrap = tk.Frame(win, bg=C["surface_soft"])
         pad_x, pad_y = self.px(24), self.px(20)
         wrap.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
 
-        tk.Label(wrap, text="自动休眠失败", bg=C["red_bg"], fg=C["red"],
+        tk.Label(wrap, text="自动休眠失败", bg=C["surface_soft"], fg=C["red"],
                  font=self.f_title, anchor="w").pack(fill="x")
         tk.Label(wrap,
                  text="系统没有接受休眠请求（可能禁用了休眠）。\n"
                       "不会再重试，也不会再响。请自己保存工作并插电。",
-                 bg=C["red_bg"], fg="#7A4A4A", font=self.f_txt,
+                 bg=C["surface_soft"], fg=C["muted"], font=self.f_txt,
                  anchor="w", justify="left",
                  wraplength=self.px(340)).pack(fill="x", pady=(self.px(8), self.px(14)))
 
@@ -2443,6 +2553,47 @@ def self_test():
     assert cmd.startswith('"'), f"命令必须带引号（目录里有空格）：{cmd}"
     assert cmd.count('"') >= 2, cmd
 
+    # exe 分支的引号：源码模式走不到这条路径，但去掉引号后含空格的安装目录
+    # 开机根本起不来，而绝大多数用户用的是 exe。
+    _saved_frozen = globals()["FROZEN"]
+    globals()["FROZEN"] = True
+    try:
+        cmd_exe = _autostart_command()
+        assert cmd_exe == f'"{sys.executable}"', \
+            f"exe 分支必须给 exe 路径加引号：{cmd_exe}"
+    finally:
+        globals()["FROZEN"] = _saved_frozen
+
+    # py.exe 解析失败必须返回 None（调用方退回 py.exe，最坏只是闪黑框）。
+    # 绝不能返回不存在的路径——那会让开机自启直接失效，而且用户看不出来。
+    assert _resolve_py_launcher("C:\\definitely\\not\\exists\\py.exe") is None
+
+    # hibernate() 必须用「休眠」而不是「待机」：SetSuspendState 第一个参数
+    # 1=Hibernate、0=Suspend。改成 0 会退化成待机——继续耗电，最终仍然硬关机，
+    # 正好是 L6 要防的那件事。整套测试因为整体打桩 hibernate()，从来没验过这里。
+    class _FakePowrprof:
+        def __init__(self):
+            self.calls = []
+
+        def SetSuspendState(self, hibernate_flag, force, disable_wake):
+            self.calls.append((hibernate_flag, force, disable_wake))
+            return 1
+
+    _fake_pp = _FakePowrprof()
+    _saved_windll = ctypes.windll
+
+    class _FakeWindll:
+        powrprof = _fake_pp
+
+    ctypes.windll = _FakeWindll()
+    try:
+        assert hibernate() is True
+        assert _fake_pp.calls, "hibernate() 没有调用 SetSuspendState"
+        assert _fake_pp.calls[0][0] == 1, \
+            f"SetSuspendState 第一个参数必须是 1（休眠），实际 {_fake_pp.calls}"
+    finally:
+        ctypes.windll = _saved_windll
+
     class _Key:
         def __init__(self, path):
             self.path = path
@@ -2540,6 +2691,20 @@ def self_test():
     assert _capacity_from_report_xml(
         "<a><FullChargeCapacity>999999</FullChargeCapacity></a>") is None, "离谱值应丢弃"
 
+    # 多电池必须累加。只取第一个的话，两块 40 Wh 会读成 40 Wh（少算一半），
+    # 而 40 落在 5-300 Wh 的合理性区间里，校验拦不住 —— 静默把账本数字砍半。
+    _two = ("<BatteryReport>"
+            "<Battery><FullChargeCapacity>40000</FullChargeCapacity></Battery>"
+            "<Battery><FullChargeCapacity>40000</FullChargeCapacity></Battery>"
+            "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_two) - 80.0) < 0.15, \
+        f"两块 40Wh 应累加为 80Wh，实际 {_capacity_from_report_xml(_two)}"
+
+    # 标签带属性时也要能解析（当前 powercfg 不加，属未来兼容）
+    assert abs(_capacity_from_report_xml(
+        '<a><FullChargeCapacity unit="mWh">50000</FullChargeCapacity></a>') - 50.0) < 0.15, \
+        "带属性的标签必须能解析"
+
     # 离电时长与周对比
     _d = date(2026, 10, 31)
     st = {}
@@ -2562,6 +2727,32 @@ def self_test():
     assert fmt_hours(0) == "—"
     assert fmt_hours(1800) == "30 分钟", fmt_hours(1800)
     assert fmt_hours(7200) == "2.0 小时", fmt_hours(7200)
+
+    # 本周 / 上周各 7 天，不能重叠。`i < 7` 改成 `i <= 7` 会让本周多吃一天、
+    # 上周少吃一天，周对比的「变化」跟着错。
+    _wk_days = {str(_d - timedelta(days=i)): 3600.0 for i in range(14)}
+    wk, lw = weekly_on_battery({"days": _wk_days}, _d)
+    assert abs(wk - 7 * 3600) < 1e-6, f"本周应恰好 7 天，实际 {wk / 3600:.1f} 天"
+    assert abs(lw - 7 * 3600) < 1e-6, f"上周应恰好 7 天，实际 {lw / 3600:.1f} 天"
+
+    # 离电时长的单次上限：休眠/挂起几小时醒来后，不能把整段时间算进今天
+    assert clamp_tick_dt(1000.0, 0.0) == 60.0, "间隔再长也只能记 60 秒"
+    assert clamp_tick_dt(100.0, 40.0) == 60.0
+    assert clamp_tick_dt(50.0, 40.0) == 10.0, "正常间隔应原样返回"
+    assert clamp_tick_dt(40.0, 50.0) == 0.0, "时间倒退不该产生负数"
+
+    # 只在用户没填过容量时才自动读，否则会覆盖他手工填的值
+    assert should_autofill_capacity({"capacity_wh": 60.0}) is True
+    assert should_autofill_capacity({"capacity_wh": 84.1}) is False, \
+        "用户手填的容量不能被自动读取覆盖"
+    assert should_autofill_capacity({"capacity_wh": 60.0}, demo=True) is False, \
+        "演示模式不该起线程读硬件"
+    assert should_autofill_capacity({}) is False, "缺键时不该当成默认值去读"
+    assert should_autofill_capacity({"capacity_wh": "abc"}) is False, "脏值要能兜住"
+
+    # powercfg 超时是「读不到就静默退回 60Wh」的唯一闸门
+    assert POWERCAP_TIMEOUT >= 10, \
+        f"超时太短会永远读不到容量（当前 {POWERCAP_TIMEOUT} 秒）"
 
     # 日志轮转：开机自启之后这个文件是长期 append 的
     with open(LOG_PATH, "w", encoding="utf-8") as _f:

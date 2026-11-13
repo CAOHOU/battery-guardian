@@ -371,6 +371,43 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_tick_resilience(root):
+    """tick() 里抛异常后，主循环必须还能继续跑。
+
+    失效模式很具体：tick 最后那句 after 是循环唯一的续命动作，
+    任何异常跳过它，循环就永久停止——浮条不刷新、确认框不弹、保底层不触发，
+    而且没有任何提示。开机自启让进程 7×24 长期运行之后，这从理论风险变成迟早发生。
+    """
+    app = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("tick 异常后循环仍继续")
+
+    calls = {"n": 0}
+    real = app._tick_once
+
+    def boom():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("注入的异常")
+        return real()
+
+    saved_poll = app.cfg["poll_seconds"]
+    app.cfg["poll_seconds"] = 0.2      # 让重排来得快一点
+    app._tick_once = boom
+    try:
+        app.tick()                      # 第一次：抛异常，由 tick 自己兜住
+        check("异常没有冒到调用方", True)
+        pump(root, 0.8)                 # 等 after 重排触发第二次
+        check("异常后 tick 仍被再次调用", calls["n"] >= 2, f"calls={calls['n']}")
+        check("循环状态仍然存活", app._alive)
+    finally:
+        app._tick_once = real
+        app.cfg["poll_seconds"] = saved_poll
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_demo_no_persist():
     """演示模式不能往真实 stats/config 写东西。
 
@@ -459,6 +496,19 @@ def run_hibernate_failed(root):
         check("标记为休眠失败", app._hibernate_failed is True)
         check("弹出失败提示窗", app.fail_win is not None)
         check("失败时不响铃", SOUNDS == [], str(SOUNDS))
+
+        # 去重：重复调用不能堆出第二个窗口。去掉那个 `if self.fail_win is not None: return`
+        # 之后，每来一次 tick 就多一个窗口，用户得一个个关。
+        first = app.fail_win
+        before = len([w for w in app.root.winfo_children()
+                      if isinstance(w, tk.Toplevel)])
+        app._show_hibernate_failed()
+        app._show_hibernate_failed()
+        pump(root, 0.2)
+        after = len([w for w in app.root.winfo_children()
+                     if isinstance(w, tk.Toplevel)])
+        check("重复调用不新建窗口", app.fail_win is first and after == before,
+              f"窗口数 {before} -> {after}")
 
         # 再走一遍升级逻辑：不能重开保底层，否则就是每分钟响一次
         del SOUNDS[:]
@@ -620,6 +670,7 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_tick_resilience(root)
     run_demo_no_persist()
 
     root.destroy()
