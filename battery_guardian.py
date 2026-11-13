@@ -572,6 +572,14 @@ def load_stats():
 
 MAX_HISTORY_DAYS = 21
 
+# 断电事件的去抖窗口。插头接触不良时 ac 会在 True/False 之间反复跳，
+# 实测三天里出现过 44 秒内记 3 次「断电事件」——那不是 3 次断电，是一次接触不良。
+INCIDENT_DEBOUNCE_S = 300
+
+# 「已插电」按钮的点击防抖。实测 14 秒内被触发 33 次（按住/狂点），
+# 日志直接被刷屏，真实数据被淹掉。
+CLAIM_DEBOUNCE_S = 1.5
+
 # 连续多少次 tick 失败之后，界面上要说实话。
 # 6 次 × 默认 5 秒 = 30 秒：短到用户还在这台机器前，长到不会被一次抖动触发。
 TICK_FAIL_WARN = 6
@@ -841,7 +849,12 @@ HOVER_GRACE_S = 5.0      # 启动后先别急着藏，让人看清楚
 
 
 class RateEstimator:
-    """用实际电量下降速度估算剩余时间，比系统的 BatteryLifeTime 更贴近真实。"""
+    """记录电量下降速度。
+
+    注意：它现在是**兜底**，不是主力。系统值（BatteryLifeTime）来自驱动，
+    包含 CPU/GPU 负载等我们看不到的信息；这里只靠整数百分比外推，
+    量化噪声更大。实测三天后发现：区间经常宽到没法用，就是这个原因。
+    """
 
     def __init__(self, window_s=RATE_LONG_S, min_span_s=RATE_MIN_SPAN_S):
         self.samples = deque()
@@ -1011,6 +1024,10 @@ class App:
         self._esc_timer = None
         self._save_timer = 0.0
         self._incident_flag = False
+        # 上一次记录断电事件的时间，用于去抖（插头接触不良会反复跳 ac）
+        self._last_incident_ts = 0.0
+        # 「已插电」按钮的上次点击时间，用于防连点刷屏
+        self._last_claim_ts = 0.0
         # 休眠失败后不再重开倒计时。没有这个标记的话，失败 → 窗口关闭 →
         # 下一个 tick 又满足 failsafe_win is None → 重开 → 再响一声，
         # 变成「每 65 秒响一次、关不掉」的无限循环。
@@ -1098,7 +1115,9 @@ class App:
         self.menu.add_command(label="电费账本", command=self.open_ledger)
         self.menu.add_separator()
         self.menu.add_command(label="安静 30 分钟", command=lambda: self.mute(30))
+        self._menu_mute30_idx = self.menu.index("end")
         self.menu.add_command(label="安静 1 小时", command=lambda: self.mute(60))
+        self._menu_mute60_idx = self.menu.index("end")
         # 不再写死 480 分钟（8 小时），改成真的算到次日 07:00
         self.menu.add_command(label="安静到明早", command=self._mute_until_morning)
         self._menu_morning_idx = self.menu.index("end")
@@ -1377,6 +1396,20 @@ class App:
             self.cfg["capacity_wh"] = wh
             log(f"已自动读取本机电池容量 {wh} Wh（默认值是 60 Wh）")
 
+    def _mute_menu_state(self):
+        """保底层生效期间，「安静 N 分钟」应置灰。
+
+        `mute()` 只关确认框和横幅，**故意不关保底层**（第三轮修的 P0：
+        静音顺手把最后一道防线也关了）。所以在 8% 倒计时窗口开着的时候点
+        「安静 30 分钟」，界面上什么都不会变——只有日志里多一行。
+
+        **可点但没反应，比置灰更让人困惑**：用户会以为点错了，再点一次。
+        实测三天里有一次 37 秒内点了 11 次静音，就是这么来的。
+        """
+        if self.failsafe_win is not None:
+            return "disabled"
+        return "normal"
+
     def _morning_menu_state(self):
         """「安静到明早」在低电量时应置灰。
 
@@ -1407,6 +1440,14 @@ class App:
                 label=label)
         except Exception:
             pass
+        # 保底层生效期间，30/60 分钟静音同样无效，一起置灰
+        try:
+            mstate = self._mute_menu_state()
+            for idx in (self._menu_mute30_idx, self._menu_mute60_idx):
+                self.menu.entryconfigure(
+                    idx, state=tk.DISABLED if mstate == "disabled" else tk.NORMAL)
+        except Exception:
+            pass
         try:
             self.menu.tk_popup(e.x_root, e.y_root)
         finally:
@@ -1435,9 +1476,23 @@ class App:
                     x + pad, y1 + pad, x + pad + inner, y2 - pad,
                     outline=color, fill=color, width=0)
         if ac:
-            self.canvas.create_line(x + w * 0.35, y2 + self.px(1),
-                                    x + w * 0.62, y1 - self.px(1),
-                                    fill=color, width=self.px(1.6))
+            # 充电标志：电池右侧画一个闪电。
+            # 原来是一条从电池左下角拉到右上角的斜线——那正好是「禁止」符号的
+            # 画法，看起来像「电池被划掉」，而不是「正在充电」。
+            # 位置在电池帽右侧，布局里 gw 也为它多留了 10px（见 render_hud）。
+            bx = x + w + self.px(5)
+            by = cy - self.px(6)
+            px = self.px
+            pts = [
+                int(bx + px(3)), int(by),
+                int(bx + px(7)), int(by),
+                int(bx + px(4.5)), int(by + px(6)),
+                int(bx + px(8)), int(by + px(6)),
+                int(bx + px(2.5)), int(by + px(12)),
+                int(bx + px(4)), int(by + px(6)),
+                int(bx + px(0.5)), int(by + px(6)),
+            ]
+            self.canvas.create_polygon(pts, fill=color, outline="", width=0)
 
     def _render_collapsed(self):
         cv = self.canvas
@@ -1481,7 +1536,9 @@ class App:
 
         pad_x = self.px(15)
         gap = self.px(8)
-        gw = self.px(26)
+        # 充电时右边多一个闪电，宽度要留出来，否则会压到百分比文字上
+        show_bolt = self.power["ac"] and self.power.get("has_battery", True)
+        gw = self.px(26) + (self.px(10) if show_bolt else 0)
 
         x = pad_x
         glyph_x = x
@@ -1516,12 +1573,27 @@ class App:
             radii = (0, r, r, 0)
         else:
             radii = (r, r, r, r)
+        # 固定状态必须有视觉标识：悬停展开和固定展开长得一样的话，
+        # 用户分不清「现在是因为鼠标在上面才展开」还是「已经钉住了」。
+        # 边框换成主题色 + 加粗到 2px，是唯一不占内容宽度的做法。
+        if self.pinned:
+            frame_col, frame_w = accent, 2
+        else:
+            frame_col, frame_w = C["border"], 1
         self._round_rect(self.px(1), self.px(1),
                          self.hud_w - self.px(1), self.hud_h - self.px(1),
-                         *radii, fill=bg, outline=C["border"], width=1)
+                         *radii, fill=bg, outline=frame_col, width=frame_w)
+
+        # 左边再点一个小方块，像「书签」——边框变色在浅色背景上不够醒目
+        if self.pinned:
+            bm = self.px(3)
+            self.canvas.create_rectangle(
+                self.px(1), (self.hud_h - bm * 4) // 2,
+                self.px(1) + bm, (self.hud_h + bm * 4) // 2,
+                fill=accent, outline="", width=0)
 
         # 没有电池的机器上别画闪电，否则像"在给空电池充电"
-        show_bolt = self.power["ac"] and self.power.get("has_battery", True)
+        # （show_bolt 在布局阶段已经算过，这里直接用）
         self._battery_glyph(glyph_x, cy, pct, accent, show_bolt)
         cv.create_text(pct_x, cy, text=pct_txt, anchor="w", fill=accent, font=self.f_pct)
         cv.create_text(sub_x, cy, text=sub, anchor="w", fill=fg, font=self.f_txt)
@@ -1568,8 +1640,8 @@ class App:
         if lo is None:
             return "估算中"
         txt = self.fmt_duration(lo, hi)
-        # 系统估值和自己测的不是一回事，得标出来，否则两个实例看起来在互相打架
-        return ("系统" + txt) if src == "system" else txt
+        # 系统值是主路径，不用标；自己测的反而是兜底，标出来让人知道这个数更粗
+        return ("实测" + txt) if src == "measured" else txt
 
     def chip_text(self):
         # 没有电池的机器上，"连续 N 天没断电"没有意义
@@ -1579,16 +1651,26 @@ class App:
         return f"连续 {d} 天" if d > 0 else "从今天开始"
 
     def estimate(self):
-        """剩余时间区间。
+        """剩余时间。
 
-        返回 (lo_min, hi_min, source)：
-          measured —— 用最近 10 分钟和 1 小时的实测放电速率分别外推
-          system   —— 样本还不够，退回 Windows 自己的 BatteryLifeTime
-          None     —— 什么都没有
+        **优先用 Windows 的 BatteryLifeTime**：它来自驱动，包含了 CPU/GPU 负载、
+        屏幕亮度这些我们看不到的信息。
+
+        自己算的速率只在系统值不可用时兜底（刚拔电那几十秒 BatteryLifeTime
+        经常返回 -1）。原因：我们只靠整数百分比外推，短窗口要掉 2% 才算数——
+        20% 电量时，2% 的量化误差就能把结果放大 ±10%，区间特别宽就是这么来的。
+        那不是偶然抖动，是方法本身的噪声。
+
+        返回 (lo_min, hi_min, source)，source ∈ {"system", "measured", None}。
         """
         pct = self.power["pct"]
         if pct is None:
             return None, None, None
+
+        secs = self.power["secs"]
+        if secs and secs > 0:
+            m = secs / 60.0
+            return m, m, "system"
 
         rates = [r for r in (self.rate.per_min(RATE_SHORT_S, RATE_SHORT_MIN_DROP),
                              self.rate.per_min(RATE_LONG_S, RATE_LONG_MIN_DROP))
@@ -1596,24 +1678,34 @@ class App:
         if rates:
             ts = sorted(pct / r for r in rates)
             return ts[0], ts[-1], "measured"
-
-        secs = self.power["secs"]
-        if secs:
-            m = secs / 60.0
-            return m, m, "system"
         return None, None, None
 
     def fmt_duration(self, lo, hi):
-        """把分钟区间写成「约 25–40 分钟」或「约 1.8–2.9 小时」。"""
+        """写成「约 2 小时 15 分钟」——和 Windows 自己的写法一致。
+
+        区间超过 12 分钟才写区间；否则取中值写单值（系统值就是单值）。
+        """
+        def hm(m):
+            m = int(round(m))
+            h, mm = divmod(max(0, m), 60)
+            return h, mm
+
         if hi < 60:
             if hi - lo >= 5:
                 return f"约 {int(round(lo))}–{int(round(hi))} 分钟"
             return f"约 {int(round((lo + hi) / 2))} 分钟"
-        lo_h, hi_h = lo / 60.0, hi / 60.0
-        if hi_h - lo_h >= 0.4:
-            return f"约 {lo_h:.1f}–{hi_h:.1f} 小时"
-        # 分钟档取中值，小时档原来取上界，两档口径不一致（小时档偏乐观）
-        return f"约 {(lo + hi) / 2 / 60.0:.1f} 小时"
+
+        if hi - lo >= 12:
+            lo_h, lo_m = hm(lo)
+            hi_h, hi_m = hm(hi)
+            if lo_h == hi_h:
+                return f"约 {lo_h} 小时 {lo_m}–{hi_m} 分钟"
+            return f"约 {lo_h} 小时 {lo_m} 分 – {hi_h} 小时 {hi_m} 分"
+
+        h, m = hm((lo + hi) / 2)
+        if m == 0:
+            return f"约 {h} 小时"
+        return f"约 {h} 小时 {m} 分钟"
 
     def minutes_left(self):
         lo, hi, _ = self.estimate()
@@ -1711,7 +1803,10 @@ class App:
             self._close_failsafe()
             self._hide_banner()
             self.dialog_ignored = 0
-            self._incident_flag = False
+            # 插头接触不良时 ac 会反复跳变。原来一插电就重置去重标记，
+            # 结果 44 秒内能记 3 次「断电事件」（实测日志）。5 分钟内只认一次。
+            if now - self._last_incident_ts > INCIDENT_DEBOUNCE_S:
+                self._incident_flag = False
             self._mark_clean_day()
         else:
             self._handle_escalation(now)
@@ -1747,6 +1842,7 @@ class App:
                     self.stats["dirty_today"] = str(date.today())
                     self.stats["streak_days"] = 0
                     _save_json(STATS_PATH, self.stats)
+                    self._last_incident_ts = now
                     log(f"记录一次断电事件，累计 {self.stats['incidents']} 次")
             # 休眠失败过就别再重开倒计时：重开只会变成无限响铃
             if (self.cfg.get("enable_fail_safe") and not self.demo
@@ -1870,6 +1966,14 @@ class App:
         # 这两行日志是「试用期复盘」的唯一数据源：
         # 点了按钮之后到底插没插，只有这里知道。没有它，事后无法回答
         # 「提醒有没有让人真的去插电」——而那正是这个工具的全部主张。
+        #
+        # 防抖：实测 14 秒内被触发 33 次（按住 / 狂点），日志被刷屏，
+        # 真实数据被淹掉。1.5 秒内重复点击直接忽略。
+        now = time.time()
+        if now - self._last_claim_ts < CLAIM_DEBOUNCE_S:
+            return
+        self._last_claim_ts = now
+
         pct = self.power.get("pct")
         if self.demo_pct is not None:
             p = {"ac": False}
@@ -2388,12 +2492,51 @@ def self_test():
     assert short > long_, "短窗口速率应快于长窗口"
 
     # 区间文案
-    assert App.fmt_duration(None, 110, 172) == "约 1.8–2.9 小时", \
+    assert App.fmt_duration(None, 110, 172) == "约 1 小时 50 分 – 2 小时 52 分", \
         App.fmt_duration(None, 110, 172)
     assert App.fmt_duration(None, 25, 40) == "约 25–40 分钟", \
         App.fmt_duration(None, 25, 40)
-    assert App.fmt_duration(None, 90, 96) == "约 1.6 小时", \
+    assert App.fmt_duration(None, 90, 96) == "约 1 小时 33 分钟", \
         App.fmt_duration(None, 90, 96)
+
+    # 剩余时间必须优先用系统值。三天实测发现自研速率估算的区间经常宽到
+    # 没法用——整数百分比的量化噪声，不是偶发抖动。
+    class _EstStub:
+        power = {"pct": 50, "secs": 3600, "ac": False}
+
+        class rate:
+            @staticmethod
+            def per_min(*a):
+                return 0.5      # 故意给一个可用的实测速率
+
+    lo, hi, src = App.estimate(_EstStub())
+    assert src == "system", f"系统值可用时必须优先用它，实际用了 {src}"
+    assert (lo, hi) == (60.0, 60.0), (lo, hi)
+
+    # 系统值不可用时才退回实测
+    class _EstStub2:
+        power = {"pct": 50, "secs": 0, "ac": False}
+
+        class rate:
+            @staticmethod
+            def per_min(*a):
+                return 0.5
+
+    _, _, src2 = App.estimate(_EstStub2())
+    assert src2 == "measured", f"系统值不可用时应退回实测，实际 {src2}"
+
+    # 保底层生效期间，「安静 N 分钟」必须置灰——静音对倒计时无效，
+    # 可点但没反应比置灰更让人困惑（实测有 37 秒点 11 次的情况）。
+    class _MuteStub:
+        failsafe_win = None
+
+    assert App._mute_menu_state(_MuteStub()) == "normal"
+
+    class _MuteStub2:
+        failsafe_win = object()
+
+    assert App._mute_menu_state(_MuteStub2()) == "disabled", \
+        "保底层生效期间静音菜单必须置灰"
 
     # 台式机回归：从原始字节解析，255（未知）必须读成 255，不能是 -1。
     # 注意要用 from_buffer_copy 而不是给字段赋值——赋值测的是写入，测不出符号
@@ -2475,7 +2618,7 @@ def self_test():
     assert abs(m - 30) <= 1, f"06:30 → 7:00 应约 30 分钟，实际 {m}"
 
     # 时长文案：小时档要取中值，不能取上界（分钟档本来就是中值，两档口径要一致）
-    assert App.fmt_duration(None, 100, 106) == "约 1.7 小时", \
+    assert App.fmt_duration(None, 100, 106) == "约 1 小时 43 分钟", \
         App.fmt_duration(None, 100, 106)
 
     # estimate()：噪声门槛必须真的生效，否则会算出"43% 还能撑 43 小时"

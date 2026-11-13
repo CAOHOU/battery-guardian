@@ -401,6 +401,7 @@ def run_claim_logging(root):
 
         # 真插电 → 必须记「确认已插电」
         logs.clear()
+        app._last_claim_ts = 0      # 绕过防抖（两次点击在测试里是同一瞬间）
         bg.read_power = lambda: {"ac": True, "pct": 15, "secs": None,
                                  "charging": True, "has_battery": True}
         app._on_claim_plugged()
