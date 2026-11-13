@@ -18,7 +18,9 @@
       python battery_guardian.py --self-test  无界面自检
 """
 
+import contextlib
 import ctypes
+import io
 import json
 import os
 import sys
@@ -2150,6 +2152,41 @@ def self_test():
     p3 = type("P", (), {"demo": True})()
     assert force_demo_for_panel(p3, "failsafe") is False, "已经是 demo 就不必再改"
 
+    # main 里的面板分发：--panel failsafe 必须真的走到强制 demo，
+    # 只测 force_demo_for_panel 是不够的——删掉调用点测试照样绿。
+    class _FakeRoot:
+        def __init__(self):
+            self.afters = []
+
+        def after(self, ms, fn):
+            self.afters.append(fn)
+
+    class _PanelApp:
+        demo = False
+        opened = 0
+
+        def _open_failsafe(self):
+            self.opened += 1
+
+        def open_ledger(self):
+            pass
+
+        def open_about(self):
+            pass
+
+    pa, fr = _PanelApp(), _FakeRoot()
+    with contextlib.redirect_stdout(io.StringIO()):
+        dispatch_panel(pa, "failsafe", fr)
+    assert pa.demo is True, "dispatch_panel 必须强制演示模式"
+    assert fr.afters, "必须排入打开保底层的调用"
+    fr.afters[0]()
+    assert pa.opened == 1, "排入的应该是 _open_failsafe"
+
+    # 其他面板不该改 demo
+    pa2, fr2 = _PanelApp(), _FakeRoot()
+    dispatch_panel(pa2, "ledger", fr2)
+    assert pa2.demo is False, "非 failsafe 面板不该改 demo"
+
     # 右键「安静到明早」的置灰判定（弹出菜单本身没法在自动化里触发）
     def _mm(pct, ac=False):
         return type("M", (), {"power": {"ac": ac, "pct": pct}, "cfg": cfg})()
@@ -2205,6 +2242,23 @@ def force_demo_for_panel(app, panel):
         app.demo = True
         return True
     return False
+
+
+def dispatch_panel(app, panel, root):
+    """按 --panel 打开对应窗口。
+
+    单独抽出来是为了能测：`--panel failsafe` 的强制演示模式原来写在 main() 里，
+    删掉它没有任何测试会红——而那正好是「看一眼界面，机器睡过去」的入口。
+    """
+    if panel == "ledger":
+        root.after(300, app.open_ledger)
+    elif panel == "failsafe":
+        if force_demo_for_panel(app, panel):
+            log("--panel failsafe 未带 --demo，已强制演示模式（不会真的休眠）")
+            print("提示：--panel failsafe 未带 --demo，已强制演示模式，不会真的休眠。")
+        root.after(300, app._open_failsafe)
+    elif panel == "about":
+        root.after(300, app.open_about)
 
 
 def main():
@@ -2275,15 +2329,7 @@ def main():
     root = tk.Tk()
     root.withdraw()
     app = App(root, load_config(), load_stats(), demo_pct=demo_pct)
-    if panel == "ledger":
-        root.after(300, app.open_ledger)
-    elif panel == "failsafe":
-        if force_demo_for_panel(app, panel):
-            log("--panel failsafe 未带 --demo，已强制演示模式（不会真的休眠）")
-            print("提示：--panel failsafe 未带 --demo，已强制演示模式，不会真的休眠。")
-        root.after(300, app._open_failsafe)
-    elif panel == "about":
-        root.after(300, app.open_about)
+    dispatch_panel(app, panel, root)
     root.mainloop()
 
 
