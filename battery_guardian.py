@@ -572,14 +572,6 @@ def load_stats():
 
 MAX_HISTORY_DAYS = 21
 
-# 断电事件的去抖窗口。插头接触不良时 ac 会在 True/False 之间反复跳，
-# 实测三天里出现过 44 秒内记 3 次「断电事件」——那不是 3 次断电，是一次接触不良。
-INCIDENT_DEBOUNCE_S = 300
-
-# 「已插电」按钮的点击防抖。实测 14 秒内被触发 33 次（按住/狂点），
-# 日志直接被刷屏，真实数据被淹掉。
-CLAIM_DEBOUNCE_S = 1.5
-
 # 连续多少次 tick 失败之后，界面上要说实话。
 # 6 次 × 默认 5 秒 = 30 秒：短到用户还在这台机器前，长到不会被一次抖动触发。
 TICK_FAIL_WARN = 6
@@ -1024,10 +1016,6 @@ class App:
         self._esc_timer = None
         self._save_timer = 0.0
         self._incident_flag = False
-        # 上一次记录断电事件的时间，用于去抖（插头接触不良会反复跳 ac）
-        self._last_incident_ts = 0.0
-        # 「已插电」按钮的上次点击时间，用于防连点刷屏
-        self._last_claim_ts = 0.0
         # 休眠失败后不再重开倒计时。没有这个标记的话，失败 → 窗口关闭 →
         # 下一个 tick 又满足 failsafe_win is None → 重开 → 再响一声，
         # 变成「每 65 秒响一次、关不掉」的无限循环。
@@ -1803,10 +1791,10 @@ class App:
             self._close_failsafe()
             self._hide_banner()
             self.dialog_ignored = 0
-            # 插头接触不良时 ac 会反复跳变。原来一插电就重置去重标记，
-            # 结果 44 秒内能记 3 次「断电事件」（实测日志）。5 分钟内只认一次。
-            if now - self._last_incident_ts > INCIDENT_DEBOUNCE_S:
-                self._incident_flag = False
+            # 插电就允许下一次事件重新计数。
+            # 曾加过 5 分钟去抖，理由是「插头接触不良会反复跳 ac」——
+            # 后来确认那三次是用户主动插拔测试，不是接触不良，已撤销。
+            self._incident_flag = False
             self._mark_clean_day()
         else:
             self._handle_escalation(now)
@@ -1842,7 +1830,6 @@ class App:
                     self.stats["dirty_today"] = str(date.today())
                     self.stats["streak_days"] = 0
                     _save_json(STATS_PATH, self.stats)
-                    self._last_incident_ts = now
                     log(f"记录一次断电事件，累计 {self.stats['incidents']} 次")
             # 休眠失败过就别再重开倒计时：重开只会变成无限响铃
             if (self.cfg.get("enable_fail_safe") and not self.demo
@@ -1967,13 +1954,9 @@ class App:
         # 点了按钮之后到底插没插，只有这里知道。没有它，事后无法回答
         # 「提醒有没有让人真的去插电」——而那正是这个工具的全部主张。
         #
-        # 防抖：实测 14 秒内被触发 33 次（按住 / 狂点），日志被刷屏，
-        # 真实数据被淹掉。1.5 秒内重复点击直接忽略。
-        now = time.time()
-        if now - self._last_claim_ts < CLAIM_DEBOUNCE_S:
-            return
-        self._last_claim_ts = now
-
+        # 曾经加过 1.5 秒防抖，理由是「14 秒 33 次点击刷屏」。
+        # 后来确认那些连点是用户**故意做的测试**，防抖会吞掉真实操作，已撤销。
+        # 日志刷屏不是缺陷——那是真实行为的忠实记录。
         pct = self.power.get("pct")
         if self.demo_pct is not None:
             p = {"ac": False}

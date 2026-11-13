@@ -371,6 +371,34 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_measured_prefix(root):
+    """实测兜底时必须标「实测」——否则用户以为它和系统值一样准。
+
+    系统值是驱动算的（含负载），实测是整数百分比外推的（噪声大）。
+    两者长得一样的话，用户没法判断这个数该信几分。
+    """
+    app = make_app(root, 80, "right")
+    pump(root, 0.3)
+    stage("剩余时间来源标注")
+
+    orig = app.estimate
+    try:
+        app.estimate = lambda: (90.0, 96.0, "measured")
+        txt = app.sub_text()
+        check("实测值带「实测」前缀", txt.startswith("实测"), txt)
+
+        app.estimate = lambda: (93.0, 93.0, "system")
+        txt2 = app.sub_text()
+        check("系统值不带前缀", not txt2.startswith("实测"), txt2)
+        check("系统值格式是「X 小时 X 分钟」",
+              "小时" in txt2 and "分钟" in txt2, txt2)
+    finally:
+        app.estimate = orig
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_claim_logging(root):
     """点「已插电」必须留痕——这是试用期复盘的唯一数据源。
 
@@ -401,7 +429,6 @@ def run_claim_logging(root):
 
         # 真插电 → 必须记「确认已插电」
         logs.clear()
-        app._last_claim_ts = 0      # 绕过防抖（两次点击在测试里是同一瞬间）
         bg.read_power = lambda: {"ac": True, "pct": 15, "secs": None,
                                  "charging": True, "has_battery": True}
         app._on_claim_plugged()
@@ -791,6 +818,7 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_measured_prefix(root)
     run_claim_logging(root)
     run_tick_resilience(root)
     run_demo_no_persist()
