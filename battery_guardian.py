@@ -42,7 +42,7 @@ APP_NAME = "电量守护"
 # ---- 元信息：单一来源 ----------------------------------------------------
 # 改这里就够了。build_exe.bat 会读这几个常量自动生成 version_info.txt，
 # 让 exe 属性里的「公司 / 版权 / 版本」跟源码保持一致。
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__ = "CAOHOU"
 __license__ = "MIT"
 __year__ = "2026"
@@ -626,12 +626,18 @@ def weekly_on_battery(stats, today=None):
 
 
 def fmt_hours(seconds):
-    """秒数 → 「3.2 小时」/「40 分钟」/「—」。"""
+    """秒数 → 「3 小时 12 分钟」/「40 分钟」/「—」。
+
+    和剩余时间用同一套写法。原来是「3.2 小时」——同一个程序里两种时长格式，
+    账本写「3.2 小时」、浮条写「3 小时 12 分钟」，读起来要换算一次。
+    """
     if not seconds or seconds <= 0:
         return "—"
-    if seconds < 3600:
-        return f"{int(round(seconds / 60))} 分钟"
-    return f"{seconds / 3600.0:.1f} 小时"
+    m = int(round(seconds / 60.0))
+    if m < 60:
+        return f"{m} 分钟"
+    h, mm = divmod(m, 60)
+    return f"{h} 小时" + (f" {mm} 分钟" if mm else "")
 
 
 def advance_streak(stats, today=None):
@@ -1142,10 +1148,17 @@ class App:
 
     def _drag_start(self, e):
         self._drag_off = (e.x_root - self.hud_x, e.y_root - self.hud_y)
+        self._drag_origin = (e.x_root, e.y_root)
         self._dragged = False
 
     def _drag_move(self, e):
         if not self._dragged:
+            # 必须给一个移动阈值。原来只要收到 <B1-Motion> 就把 _dragged 置真，
+            # 鼠标抖一个像素都算拖拽，于是 _drag_end 走拖拽分支、不调 _on_click——
+            # 表现就是「点一下没反应，要再点一下」。
+            if (abs(e.x_root - self._drag_origin[0]) < self.px(4)
+                    and abs(e.y_root - self._drag_origin[1]) < self.px(4)):
+                return
             self._dragged = True
             if self.collapsed:
                 self.collapsed = False
@@ -1181,8 +1194,15 @@ class App:
         self.pinned = not self.pinned
         if self.pinned:
             self.expand()
+            # 已展开时 expand() 会提前 return，但 pinned 已经变了，
+            # 必须立刻重画——否则边框和书签要等下一次 tick 才出现，
+            # 看起来就像「点了没反应」。
+            self.render_hud()
         else:
-            self._last_hover = 0.0
+            # 取消固定立刻收起。原来只把 _last_hover 清零，
+            # 鼠标还在上面就一直展开着，用户同样会觉得「点了没反应」。
+            # 低电量时 collapse() 会被 _can_collapse() 挡下，那是安全优先，符合预期。
+            self.collapse()
         self._save_cfg()
 
     def _save_cfg(self):
@@ -1265,7 +1285,7 @@ class App:
             x_from = -(full - bar) if expanding else 0
             x_to = 0 if expanding else -(full - bar)
 
-        steps = 9
+        steps = 6      # 90ms（6 × 15），比原来的 135ms 更跟手
 
         def step(i):
             if gen != self._anim_gen or not self._alive:
@@ -2312,9 +2332,10 @@ class App:
                  anchor="w", justify="left",
                  wraplength=inner_w).pack(fill="x", pady=(self.px(6), 0))
 
-        tk.Label(wrap, text="剩余时间 = 电量 ÷ 耗电速度。用最近 10 分钟和 1 小时各算一次，"
-                            "两者差距大时显示区间——它反映的是「按你刚才的用法还能撑多久」，"
-                            "不是承诺。刚启动时标「系统」的是 Windows 自己的估值。",
+        tk.Label(wrap, text="剩余时间优先用 Windows 自己的估算（它读的是毫瓦时，"
+                            "比整数百分比精细得多）；系统值暂时无效时退回实测，"
+                            "会标「实测」提醒你这个数更粗。它是「此刻功耗下还能撑多久」，"
+                            "不是承诺——负载一变数字就会跟着变。",
                  bg=C["surface"], fg=C["faint"], font=self.f_sm,
                  anchor="w", justify="left",
                  wraplength=inner_w).pack(fill="x", pady=(self.px(12), 0))
@@ -3143,7 +3164,7 @@ def self_test():
 
     assert fmt_hours(0) == "—"
     assert fmt_hours(1800) == "30 分钟", fmt_hours(1800)
-    assert fmt_hours(7200) == "2.0 小时", fmt_hours(7200)
+    assert fmt_hours(7200) == "2 小时", fmt_hours(7200)
 
     # 本周 / 上周各 7 天，不能重叠。`i < 7` 改成 `i <= 7` 会让本周多吃一天、
     # 上周少吃一天，周对比的「变化」跟着错。

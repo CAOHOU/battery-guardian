@@ -138,15 +138,31 @@ def run(root, pct, dock, expect_collapse=True):
     class _E:
         x_root = 600
         y_root = 300
+
+    class _E2:
+        # 必须真的移动超过阈值（4px），否则会被判成单击——
+        # 那正是修复「点一下没反应」时加的行为。
+        x_root = 640
+        y_root = 300
+
     app._drag_start(_E())
     check("拖动开始时清空标记", app._dragged is False)
-    app._drag_move(_E())
+    app._drag_move(_E2())
     # 随机变异抽样发现的盲区：把 `if not self._dragged` 的 not 去掉，
     # 整段（标记 + 解除停靠）都被跳过，拖了等于没拖
     check("拖动后标记为已拖动", app._dragged is True)
     check("拖动后解除停靠", app.dock_edge is None, f"dock={app.dock_edge}")
-    app._drag_end(_E())
+    app._drag_end(_E2())
     pump(root, 0.2)
+
+    # 手抖不该被当成拖拽，否则单击会被吃掉
+    app._drag_start(_E())
+    class _E3:
+        x_root = 602       # 只动 2px
+        y_root = 301
+    app._drag_move(_E3())
+    check("手抖 2px 不算拖拽", app._dragged is False)
+    app._dragged = False
 
     stage("拖离边缘 → 解除停靠")
     app._dragged = True
@@ -869,7 +885,7 @@ def run_ledger(root):
     texts = _labels(app.ledger_win)
     check("账本显示本周离电", any("本周" in t for t in texts), str(texts[:8]))
     check("账本显示上周离电", any("上周" in t for t in texts), str(texts[:8]))
-    check("账本显示 2.0 小时", any("2.0 小时" in t for t in texts), str(texts))
+    check("账本显示 2 小时", any("2 小时" in t for t in texts), str(texts))
 
     if app.ledger_win is not None:
         app.ledger_win.destroy()

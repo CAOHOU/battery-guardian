@@ -177,8 +177,8 @@ pythonw battery_guardian.py
 推荐做法是把 `BatteryGuardian.exe` 作为 **GitHub Release 附件**发布：
 
 ```bash
-gh release create v1.0.0 dist/BatteryGuardian.exe \
-  --title "v1.0.0" --notes "首个版本"
+gh release create v1.0.1 dist/BatteryGuardian.exe \
+  --title "v1.0.1" --notes "首个版本"
 ```
 
 如果你更希望 exe 直接躺在仓库里，把 `.gitignore` 里的 `dist/` 删掉即可。
@@ -420,12 +420,12 @@ battery-guardian/
 
 - **作者**：[@CAOHOU](https://github.com/CAOHOU)
 - **协议**：[MIT](LICENSE)
-- **版本**：1.0.0
+- **版本**：1.0.1
 
 署名只在一处维护 —— `battery_guardian.py` 顶部的元信息常量：
 
 ```python
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __author__  = "CAOHOU"
 __license__ = "MIT"
 ```
