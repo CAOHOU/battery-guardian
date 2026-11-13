@@ -177,8 +177,8 @@ pythonw battery_guardian.py
 推荐做法是把 `BatteryGuardian.exe` 作为 **GitHub Release 附件**发布：
 
 ```bash
-gh release create v1.0.1 dist/BatteryGuardian.exe \
-  --title "v1.0.1" --notes "首个版本"
+gh release create v1.1 dist/BatteryGuardian.exe \
+  --title "v1.1" --notes "首个版本"
 ```
 
 如果你更希望 exe 直接躺在仓库里，把 `.gitignore` 里的 `dist/` 删掉即可。
@@ -188,7 +188,7 @@ gh release create v1.0.1 dist/BatteryGuardian.exe \
 **实测（本机）**
 
 - 源码运行：浮条四档状态（已接电 / 45% / 15% / 5%）、确认框、休眠倒计时、账本、L4 横幅
-- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **194 项断言**，连续多轮全通过
+- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **197 项断言**，连续多轮全通过
 - 自动收起：启动 5 秒宽限期后，鼠标不在浮条上会自行收成彩条
 - exe：`--where` / `--once` / `--self-test` 与 GUI 启动、自动收起、确认框、窗口图标
 - **打包流程不碰用户数据**：`selftest_verify.py` 造一个假 app_home 跑一遍 `verify_exe.py`，
@@ -405,7 +405,7 @@ python selftest_verify.py
 ```
 battery-guardian/
   battery_guardian.py   全部逻辑，单文件
-  selftest_ui.py        界面冒烟测试（194 项断言）
+  selftest_ui.py        界面冒烟测试（197 项断言）
   selftest_layout.py    布局矩阵测试（12 种屏幕 × DPI）
   selftest_verify.py    打包验证不得碰真实数据
   verify_exe.py         打包后自动验证 exe（build_exe.bat 调用）
@@ -422,12 +422,12 @@ battery-guardian/
 
 - **作者**：[@CAOHOU](https://github.com/CAOHOU)
 - **协议**：[MIT](LICENSE)
-- **版本**：1.0.1
+- **版本**：1.1
 
 署名只在一处维护 —— `battery_guardian.py` 顶部的元信息常量：
 
 ```python
-__version__ = "1.0.1"
+__version__ = "1.1"
 __author__  = "CAOHOU"
 __license__ = "MIT"
 ```

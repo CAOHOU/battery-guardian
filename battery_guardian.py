@@ -43,7 +43,7 @@ APP_NAME = "电量守护"
 # ---- 元信息：单一来源 ----------------------------------------------------
 # 改这里就够了。build_exe.bat 会读这几个常量自动生成 version_info.txt，
 # 让 exe 属性里的「公司 / 版权 / 版本」跟源码保持一致。
-__version__ = "1.0.1"
+__version__ = "1.1"
 __author__ = "CAOHOU"
 __license__ = "MIT"
 __year__ = "2026"
@@ -615,6 +615,16 @@ def load_stats():
     d = default_stats()
     if not isinstance(st.get("days"), dict):
         st["days"] = {}
+    else:
+        # 逐日值也要清洗：值不是数字时，record_on_battery 会抛异常，
+        # 然后被 tick 兜住 → 显示「电量读取失败」（把数据问题报成硬件问题）。
+        clean_days = {}
+        for k, v in st["days"].items():
+            try:
+                clean_days[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        st["days"] = clean_days
     for k in ("streak_days", "incidents"):
         v = st.get(k)
         if not isinstance(v, int) or isinstance(v, bool):
@@ -669,7 +679,14 @@ def record_on_battery(stats, seconds, today=None):
     today = today or date.today()
     days = stats.setdefault("days", {})
     key = str(today)
-    days[key] = round(float(days.get(key, 0.0)) + float(seconds), 1)
+    # 值是脏的（手改过 stats.json、旧版本写坏）时不能崩：
+    # float("abc") 抛 ValueError 会被 tick 兜住 → 显示「电量读取失败」，
+    # 把**数据问题报成硬件问题**，而且文件不自己修好就永远显示下去。
+    try:
+        prev = float(days.get(key, 0.0))
+    except (TypeError, ValueError):
+        prev = 0.0
+    days[key] = round(prev + float(seconds), 1)
     if len(days) > MAX_HISTORY_DAYS:
         for old in sorted(days)[:-MAX_HISTORY_DAYS]:
             days.pop(old, None)
@@ -1023,7 +1040,13 @@ def level_for(pct, ac, cfg):
         return "calm"
     th = cfg["thresholds"]
     if pct <= th["fail_safe"]:
-        return "fail_safe"
+        # 关掉保底层时不能再报 fail_safe。原来 level_for 不知道这个开关，
+        # 于是「enable_fail_safe: false」的用户会看到浮条写着「马上休眠」、
+        # 账本记一次断电事件、静音菜单还可能置灰——而实际上什么都不会发生。
+        # 降级到 dialog：提醒还在，只是不再自动休眠。
+        if cfg.get("enable_fail_safe", True):
+            return "fail_safe"
+        return "dialog"
     if pct <= th["dialog"]:
         return "dialog"
     if pct <= th["nudge"]:
@@ -2103,6 +2126,10 @@ class App:
         self.dialog_next_push = time.time() + self.cfg["dialog_regrow_seconds"]
         if self.dialog_grow < 3:
             self.dialog_grow += 1
+            # 这条日志是为了回答「它到底放大了没有」。原来 _push_dialog 不留痕，
+            # 用户说「没感觉变大」时，日志里查不到任何证据。
+            log(f"确认框放大到第 {self.dialog_grow} 档"
+                f"（宽 +{30 * self.dialog_grow}px）")
             self._render_dialog()
         else:
             self._shake()
@@ -2465,7 +2492,17 @@ def self_test():
         _self_test_body()
 
 
+def _stage(name):
+    """打印分组名。失败时至少知道是哪一段，而不是只有一个行号。
+
+    这是「拆分 868 行」的轻量替代：真拆要重新验证每段的共享状态
+    （globals 打桩、假 winsound、裸 assert 短路），风险远大于收益。
+    加分组打印解决的是同一个痛点——定位——成本只有几行。
+    """
+    print(f"[自检] {name}")
+
 def _self_test_body():
+    _stage("账本")
     # 用默认值而不是用户真实配置：改过阈值的话断言会假失败
     cfg = default_config()
     stats = default_stats()
@@ -2489,6 +2526,7 @@ def _self_test_body():
     ratio_wear = deep_lg.stats["wear"] / norm_lg.stats["wear"]
     assert abs(ratio_wear - 1.5) < 1e-9, f"深放电折损应为 1.5 倍，实际 {ratio_wear:.3f}"
 
+    _stage("逃生口")
     # 逃生口：mute() 必须真的把截止时间推到将来（否则用户没法让它安静）
     class _MuteStub:
         muted_until = 0.0
@@ -2549,6 +2587,7 @@ def _self_test_body():
     App._handle_escalation(es, time.time())
     assert es.opened == 1, "静音期间到 5% 必须仍然弹出保底层，实际没有弹"
 
+    _stage("休眠失败与静音")
     # 休眠失败过之后不能再重开倒计时，否则就是无限响铃
     es_failed = _EscStub()
     es_failed._hibernate_failed = True
@@ -2579,6 +2618,7 @@ def _self_test_body():
     r.add(120, 78, False)
     assert abs(r.per_min() - 1.0) < 1e-6, "速率估算应为 1%/分钟"
 
+    _stage("速率与文案")
     # 两个窗口要能分别反映「最近」和「平均」
     r2 = RateEstimator(min_span_s=60)
     r2.add(0, 100, False)          # t=0
@@ -2665,6 +2705,7 @@ def _self_test_body():
     assert App._mute_menu_state(_MuteStub4()) == "disabled", \
         "休眠失败已停止重试时也必须置灰"
 
+    _stage("电源解析")
     # 台式机回归：从原始字节解析，255（未知）必须读成 255，不能是 -1。
     # 注意要用 from_buffer_copy 而不是给字段赋值——赋值测的是写入，测不出符号
     # （ctypes 赋值会回绕，改成 c_byte 后断言照样通过，是个假测试）。
@@ -2684,6 +2725,7 @@ def _self_test_body():
     assert App.sub_text(stub) == "已接电", App.sub_text(stub)
     assert App.chip_text(stub) == "", App.chip_text(stub)
 
+    _stage("配置净化")
     # 配置净化：手改坏的 config 不能让程序崩，也不能变成忙等
     bad = {
         "poll_seconds": 0, "capacity_wh": "abc", "dock_edge": "top",
@@ -2717,6 +2759,7 @@ def _self_test_body():
         assert p is False, f"pinned={raw!r} 应净化成 False，实际 {p!r}"
     assert _sanitize_config({"pinned": "true"})["pinned"] is True
 
+    _stage("连续天数")
     # 连续天数：断一天必须从头计。delta == 1 改成 <= 2 会让断档也算连续。
     d0 = date(2026, 10, 30)
     st = {"streak_days": 5, "last_clean_date": str(d0 - timedelta(days=1))}
@@ -2773,6 +2816,7 @@ def _self_test_body():
     lo, hi, src = App.estimate(sysonly)
     assert src == "system" and abs(lo - 10.0) < 1e-6, f"应退回系统估值，实际 {src} {lo}"
 
+    _stage("边界值")
     # 随机变异抽样发现的盲区：把 `secs is not None` 改成 `is None`，
     # 哨兵值（0 / 负数 / 超过 48 小时）就会原样显示成"还能撑 30 天"。
     assert _clean_secs(None) is None
@@ -3312,6 +3356,14 @@ def _self_test_body():
     assert App.chip_text(nb_chip) != "", \
         "缺 has_battery 时不应丢掉连续天数"
 
+    # 关掉保底层时，8% 以下不能继续报 fail_safe——
+    # 否则浮条写着「马上休眠」、账本记断电事件，而实际上什么都不会发生。
+    cfg_off = default_config()
+    cfg_off["enable_fail_safe"] = False
+    assert level_for(5, False, cfg_off) == "dialog", \
+        f"关掉保底层后 8% 应降级到 dialog，实际 {level_for(5, False, cfg_off)}"
+    assert level_for(5, False, default_config()) == "fail_safe", \
+        "保底层开着时 8% 仍应是 fail_safe"
     # 阈值整体上调时，保底层必须有**绝对**上限。
     # 级联 min(v, prev) 只保证顺序：hint=90/nudge=80/dialog=70/cost=60/
     # fail_safe=48 全部「合法」，于是 48% 就自动休眠，静音还挡不住。

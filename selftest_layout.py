@@ -154,11 +154,12 @@ def run_case(root, sw, sh, dpi):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="bg-layout-")
-    bg.DATA_DIR = tmp
-    bg.CFG_PATH = os.path.join(tmp, "config.json")
-    bg.STATS_PATH = os.path.join(tmp, "stats.json")
-    bg.LOG_PATH = os.path.join(tmp, "app.log")
+    # 同 selftest_ui：统一走 isolated_data，别各写一套。
+    with bg.isolated_data("bg-layout-") as tmp:
+        return _main_body(tmp)
+
+
+def _main_body(tmp):
 
     print("=" * 62)
     print("布局矩阵测试")

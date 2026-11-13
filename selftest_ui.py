@@ -387,6 +387,92 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_dialog_grow(root):
+    """「没插电的话，这个窗口会再大一圈」——这个承诺必须真的兑现。
+
+    实测：408 → 438 → 468 → 498（每档 +30px），第 4 次封顶改抖动。
+
+    这条原来零覆盖。用户反馈「好像没感觉会变大」时，代码里没有任何证据
+    能回答这个问题——只能靠人去量。现在不用了。
+    """
+    app = make_app(root, 16, "right")
+    pump(root, 0.5)
+    stage("弹窗放大")
+    check("前置：确认框已弹出", app.dialog is not None)
+
+    app.dialog.update_idletasks()
+    w0 = app.dialog.winfo_width()
+    widths = [w0]
+    for _ in range(3):
+        app._push_dialog()
+        pump(root, 0.2)
+        app.dialog.update_idletasks()
+        widths.append(app.dialog.winfo_width())
+
+    check("第一档确实变宽", widths[1] > widths[0], str(widths))
+    check("三档累计至少宽 60px", widths[3] - widths[0] >= 60,
+          f"{widths[0]} → {widths[3]}")
+    check("到第 3 档封顶", app.dialog_grow == 3, str(app.dialog_grow))
+
+    app._push_dialog()      # 第 4 次应走抖动，不再变大
+    pump(root, 0.2)
+    app.dialog.update_idletasks()
+    check("第 4 次不再变大（改抖动）",
+          app.dialog.winfo_width() == widths[3],
+          f"{widths[3]} → {app.dialog.winfo_width()}")
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_event_wiring(root):
+    """事件层的两条接线：插电自动关窗、单击只触发一次。
+
+    这两条原来零覆盖。审查的独立变异证实：改坏 `_close_dialog` 的调用点
+    或让 `<Button-1>` 触发两次，测试全绿。
+
+    为什么重要：
+      - 「插电自动关窗」是 11 天数据里 185 次点击 / 0 次「确认已插电」的原因
+        ——插上电窗口就自己关了，没人会在插着电的时候点那个按钮。
+      - 「单击只触发一次」关系到日志可信度：实测有 32 秒 106 次的记录，
+        如果一次按下触发多次，说谎次数会被放大几十倍。
+    """
+    app = make_app(root, 15, "right")
+    pump(root, 0.5)
+    stage("事件接线")
+    check("前置：确认框已弹出", app.dialog is not None)
+
+    # --- 1. 一次 <Button-1> 只触发一次 ---
+    calls = []
+    orig_claim = app._on_claim_plugged
+    app._on_claim_plugged = lambda: calls.append(1)
+    try:
+        app.btn.event_generate("<Button-1>", x=2, y=2)
+        pump(root, 0.25)
+    finally:
+        app._on_claim_plugged = orig_claim
+    check("一次 <Button-1> 只触发一次", len(calls) == 1, f"{len(calls)} 次")
+
+    # --- 2. 插电后确认框自动关闭（不需要点按钮）---
+    # demo_pct 不为空时 _tick_once 直接造假数据、不读 read_power，
+    # 必须先置空才能测真实分支。
+    orig_read = bg.read_power
+    orig_demo_pct = app.demo_pct
+    app.demo_pct = None
+    bg.read_power = lambda: {"ac": True, "pct": 15, "secs": 3600,
+                             "charging": True, "has_battery": True}
+    try:
+        app._tick_once()
+        pump(root, 0.25)
+    finally:
+        bg.read_power = orig_read
+        app.demo_pct = orig_demo_pct
+    check("插电后确认框自动关闭", app.dialog is None, str(app.dialog))
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_esc_escape(root):
     """长按 Esc 的逃生口必须真的静音。
 
@@ -920,12 +1006,14 @@ def run_ledger(root):
 
 
 def main():
-    # 测试写到临时目录，绝不能碰用户真实的 config / stats
-    tmp = tempfile.mkdtemp(prefix="bg-test-")
-    bg.DATA_DIR = tmp
-    bg.CFG_PATH = os.path.join(tmp, "config.json")
-    bg.STATS_PATH = os.path.join(tmp, "stats.json")
-    bg.LOG_PATH = os.path.join(tmp, "app.log")
+    # 统一走 isolated_data：4 个路径一次重定向，退出时清理。
+    # 各写一套是上一轮 P0 的成因——漏一个（比如 CFG_PATH）就等于没隔离，
+    # 而漏掉的那次恰好覆盖了用户真实账本。
+    with bg.isolated_data("bg-test-") as tmp:
+        return _main_body(tmp)
+
+
+def _main_body(tmp):
 
     # 测试期间不要真的响（会打断人，也会拖慢）
     bg.play_alert = lambda k: SOUNDS.append(k) or True
@@ -959,6 +1047,8 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_dialog_grow(root)
+    run_event_wiring(root)
     run_esc_escape(root)
     run_visual_glyphs(root)
     run_measured_prefix(root)
