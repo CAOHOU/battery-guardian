@@ -14,7 +14,13 @@ for /f "delims=" %%N in ('dir /b /ad "%LOCALAPPDATA%\Programs\Python\Python3*" 2
 
 if not defined FOUND (
   py -3 -c "import tkinter" >nul 2>nul
-  if not errorlevel 1 set "FOUND=py -3w"
+  if not errorlevel 1 (
+    rem pyw 是 py launcher 的窗口版（无控制台）。
+    rem 这里原来写的是 "py -3w"，那不是有效参数，会报
+    rem No suitable Python runtime found，启动直接失败。
+    where pyw >nul 2>nul
+    if not errorlevel 1 (set "FOUND=pyw -3") else (set "FOUND=py -3")
+  )
 )
 
 if not defined FOUND (
