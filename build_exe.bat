@@ -105,8 +105,11 @@ if errorlevel 1 (
   echo [ERROR] exe verification failed.
   rem 不用 pause：脚本被自动调用时会永久挂住，看不出是失败还是卡死。
   rem 给 15 秒窗口让双击的人看清错误，然后自己退出。
-  echo Exiting in 15 seconds...
-  "%SystemRoot%\System32\timeout.exe" /t 15 >nul 2>nul
+  rem 设 BG_NO_PAUSE=1 可跳过等待（CI / 脚本调用时用）
+  if not defined BG_NO_PAUSE (
+    echo Exiting in 15 seconds. Set BG_NO_PAUSE=1 to skip.
+    "%SystemRoot%\System32\timeout.exe" /t 15 >nul 2>nul
+  )
   exit /b 1
 )
 

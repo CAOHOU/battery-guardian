@@ -446,6 +446,34 @@ def run_tick_resilience(root):
     check("恢复后清空计数并回到正常文案",
           app2._tick_fails == 0 and app2.sub_text() != "电量读取失败", app2.sub_text())
 
+    # 界面画不出来 ≠ 电量读不到，文案要分开。
+    # 必须走真实的 tick 累加路径：直接给 _tick_tcl_fails 赋值的话，
+    # 把 tick 里那句 `self._tick_tcl_fails += 1` 删掉测试照样绿。
+    saved_poll3 = app2.cfg["poll_seconds"]
+    app2.cfg["poll_seconds"] = 100      # 别让 after 在测试期间级联触发
+
+    def always_tcl():
+        raise tk.TclError("persistent")
+
+    app2._tick_once = always_tcl
+    app2._tick_fails = 0
+    app2._tick_tcl_fails = 0
+    try:
+        for _ in range(bg.TICK_FAIL_WARN):
+            app2.tick()
+        check("连续 TclError 走真实路径后显示「界面刷新失败」",
+              app2.sub_text() == "界面刷新失败", app2.sub_text())
+    finally:
+        app2._tick_once = real2
+        app2.cfg["poll_seconds"] = saved_poll3
+        app2._tick_tcl_fails = 0
+
+    # R7：tick 成功时必须调 _note_tick_ok。这是**调用点**，不是函数本身——
+    # 只测 _note_tick_ok 能清计数是不够的，把 tick 里的 else 分支删掉照样绿。
+    app2._tick_fails = bg.TICK_FAIL_WARN
+    app2.tick()
+    check("tick 成功后失败计数归零", app2._tick_fails == 0, f"={app2._tick_fails}")
+
     teardown(app2)
     pump(root, 0.2)
 

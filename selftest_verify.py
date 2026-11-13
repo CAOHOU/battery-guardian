@@ -33,6 +33,19 @@ EXE = os.path.join(HERE, "dist", "BatteryGuardian.exe")
 KEEP = ("config.json", "stats.json")
 
 
+def _real_data_dir():
+    """应用真正会写数据的目录。
+
+    直接用应用自己的 `_app_data_root()`，不要各写一套。之前这里自己拼
+    `os.environ["LOCALAPPDATA"]`，在没有该变量的环境里会拼成相对路径
+    `BatteryGuardian\\data`，于是**测试盯的目录和应用实际写的不是同一个**，
+    而且那条 SKIP 还被算成通过——正是「声称覆盖了其实没覆盖」。
+    """
+    sys.path.insert(0, HERE)
+    from battery_guardian import _app_data_root
+    return os.path.join(_app_data_root(), "BatteryGuardian", "data")
+
+
 def main():
     print("=" * 60)
     print("verify_exe.py 数据安全测试")
@@ -54,14 +67,17 @@ def main():
 
     # 反向断言：真实 data/ 的 mtime 也不能变。
     # 只验证「假 app_home 没被删」是不够的——如果将来有人把路径改成读真实
-    # LOCALAPPDATA（比如用 expanduser("~") 拼而不是读环境变量），假目录当然还在，
-    # 但用户真实数据已经被动了，而上面那三项照样 PASS。
-    real_data = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                             "BatteryGuardian", "data")
+    # LOCALAPPDATA，假目录当然还在，但用户真实数据已经被动了，而上面那三项照样 PASS。
+    real_data = _real_data_dir()
     real_before = None
+    skipped = 0
     if os.path.isdir(real_data):
         real_before = (os.stat(real_data).st_mtime_ns,
                        sorted(os.listdir(real_data)))
+    else:
+        # 目录不存在时无法比对。这本身不算失败（可能是全新机器），
+        # 但必须让「没覆盖」这件事在末行可见，不能混在「全部通过」里。
+        skipped = 1
 
     try:
         p = subprocess.run([sys.executable, VERIFY], env=env,
@@ -96,7 +112,8 @@ def main():
 
         # 真实目录必须原封不动
         if real_before is None:
-            print("  SKIP 真实 data/ 不存在，跳过 mtime 反向断言")
+            print(f"  SKIP 真实 data/ 不存在（{real_data}），无法比对")
+            print("       这一项**没有覆盖**，别把它算进「全部通过」")
         else:
             real_after = (os.stat(real_data).st_mtime_ns,
                           sorted(os.listdir(real_data)))
@@ -111,7 +128,13 @@ def main():
         shutil.rmtree(fake, ignore_errors=True)
 
     print("=" * 60)
-    print("全部通过" if ok else "失败")
+    if not ok:
+        print("失败")
+    elif skipped:
+        # 覆盖不完整时必须说出来，不能混在「全部通过」里
+        print(f"通过（但有 {skipped} 项 SKIP，未完全覆盖）")
+    else:
+        print("全部通过")
     return 0 if ok else 1
 
 

@@ -205,14 +205,14 @@ def _capacity_from_report_xml(xml_text):
         mwh = pick("FullChargeCapacity", blk) or pick("DesignCapacity", blk)
         # 单块先各自校验：一个离谱的分段不该把整台机器的容量算飞，
         # 也不该因为它让另外几块被一起丢掉。
-        if mwh and 1_000 <= mwh <= 200_000:
+        if mwh and CELL_MWH_MIN <= mwh <= CELL_MWH_MAX:
             total_mwh += mwh
     if total_mwh <= 0:
         return None
 
     wh = total_mwh / 1000.0
     # 总量再兜一次，比单块宽：三块 100 Wh 的移动工作站也要能读出来
-    if not (5.0 <= wh <= 400.0):
+    if not (PACK_WH_MIN <= wh <= PACK_WH_MAX):
         return None
     return round(wh, 1)
 
@@ -576,6 +576,23 @@ MAX_HISTORY_DAYS = 21
 # 6 次 × 默认 5 秒 = 30 秒：短到用户还在这台机器前，长到不会被一次抖动触发。
 TICK_FAIL_WARN = 6
 
+# 连续多少次 TclError 之后彻底放弃重排。
+# 这个只针对 TclError：它通常是「浮条窗口被外部销毁」这类不可恢复的状态，
+# 再重排一万次也画不出来。60 次 × 5 秒 ≈ 5 分钟，够人反应过来。
+# 读电量失败不走这条——那可能是临时的，不该 5 分钟就放弃。
+TICK_TCL_GIVE_UP = 60
+
+# 电池容量的合理区间（毫瓦时）。单块和总量分开校验：
+# 单块拦「解析到别的数字」，总量拦「累加出一台电动车」。
+CELL_MWH_MIN = 1_000        # 1 Wh
+CELL_MWH_MAX = 200_000      # 200 Wh（市面最大笔记本电池约 100 Wh 的两倍余量）
+PACK_WH_MIN = 5.0
+PACK_WH_MAX = 400.0         # 多电池移动工作站
+
+# `py -0p` 的超时。这个调用发生在 UI 线程上（点菜单 → 写注册表 → 拼命令），
+# 给太大只会让界面在异常情况下白冻。
+PY_LAUNCHER_TIMEOUT = 3
+
 
 def record_on_battery(stats, seconds, today=None):
     """把「离电秒数」记到当天，并只保留最近 21 天。
@@ -707,7 +724,8 @@ def _resolve_py_launcher(exe=None):
     """
     exe = exe or sys.executable
     try:
-        r = subprocess.run([exe, "-0p"], capture_output=True, timeout=3,
+        r = subprocess.run([exe, "-0p"], capture_output=True,
+                           timeout=PY_LAUNCHER_TIMEOUT,
                            stdin=subprocess.DEVNULL)
         text = (r.stdout or b"").decode("utf-8", "ignore")
     except Exception:
@@ -998,8 +1016,11 @@ class App:
         # 变成「每 65 秒响一次、关不掉」的无限循环。
         self._hibernate_failed = False
         self._last_tick = time.time()
-        # 连续 tick 失败次数：到 TICK_FAIL_WARN 就让浮条承认「读不到电量」
+        # 连续 tick 失败次数：到 TICK_FAIL_WARN 就让浮条承认读不到
         self._tick_fails = 0
+        # 其中连续 TclError 的单独计数：界面画不出来和电量读不到，
+        # 对用户的含义不一样，放弃的门槛也不一样
+        self._tick_tcl_fails = 0
 
         # 账本默认 60Wh 只是占位符，和真机容量能差 40%。用户没填过时后台读一次
         # 本机真实容量——放线程里，别让 2 秒的 powercfg 卡住启动。
@@ -1524,7 +1545,10 @@ class App:
     def sub_text(self):
         # 连续失败够久就别再装作在读数——浮条还"活着"但数据已经陈旧，
         # 这是比直接死掉更糟的状态：用户以为它在工作。
+        # 两种失败分开说：界面画不出来 ≠ 电量读不到，后者才该怪电池/驱动。
         # getattr 是为了兼容自检里那些只带 power/level 的 stub。
+        if getattr(self, "_tick_tcl_fails", 0) >= TICK_FAIL_WARN:
+            return "界面刷新失败"
         if getattr(self, "_tick_fails", 0) >= TICK_FAIL_WARN:
             return "电量读取失败"
         pct = self.power["pct"]
@@ -1617,16 +1641,26 @@ class App:
         except tk.TclError as e:
             # TclError 分两种，不能一刀切 return：
             #  - 瞬时（RDP 重连、显示器切换）→ 应该重排，让它自己恢复；
-            #  - 真销毁（退出/注销）→ 下面那句 after 自己会抛 TclError 被吞掉，
-            #    循环自然终止，不需要靠这里提前退出。
+            #  - 真销毁（退出/注销）→ mainloop 已经返回，没人再调 tick；
+            #    quit() 也会先置 _alive=False。**不要指望 after 来报错**——
+            #    实测 root.destroy() 之后 after() 是静默成功的，不会抛。
             # 上一版对 TclError 直接 return，恰好漏掉了 docstring 里列为
             # 「加这个保护的主要动机」的那个场景。
+            self._tick_tcl_fails += 1
             self._note_tick_failure(e)
         except Exception as e:
+            self._tick_tcl_fails = 0
             self._note_tick_failure(e)
         else:
+            self._tick_tcl_fails = 0
             self._note_tick_ok()
         if self._alive:
+            # 浮条被外部销毁后，after 会一直成功、tick 一直失败——
+            # 一次/5 秒不烧 CPU，但永远不会停。到 GIVE_UP 就承认放弃。
+            if self._tick_tcl_fails >= TICK_TCL_GIVE_UP:
+                log(f"tick 连续 TclError {self._tick_tcl_fails} 次，"
+                    f"停止重试：浮条窗口可能已被销毁，需要重启程序")
+                return
             try:
                 self.root.after(int(self.cfg["poll_seconds"] * 1000), self.tick)
             except tk.TclError:
@@ -2657,6 +2691,30 @@ def self_test():
     finally:
         globals()["subprocess"] = _saved_sub
 
+    # 解析出来的路径必须真的存在。只测 _parse_py_launcher_output 不够——
+    # 去掉 `os.path.exists` 检查后，自启会指向一个不存在的解释器，
+    # **开机直接起不来**，是这条链上后果最重的一环。
+    class _SubWithPath:
+        DEVNULL = -3
+
+        @staticmethod
+        def run(*a, **k):
+            class _R:
+                stdout = (b" -V:3.14 *        "
+                          b"C:\\definitely\\not\\exists\\python.exe\n")
+            return _R()
+
+    globals()["subprocess"] = _SubWithPath()
+    try:
+        assert _resolve_py_launcher("C:\\Windows\\py.exe") is None, \
+            "解析出的路径不存在时必须返回 None"
+    finally:
+        globals()["subprocess"] = _saved_sub
+
+    # 超时是 UI 线程上的等待上限，太大等于界面白冻
+    assert 1 <= PY_LAUNCHER_TIMEOUT <= 5, \
+        f"PY_LAUNCHER_TIMEOUT={PY_LAUNCHER_TIMEOUT} 不在合理区间"
+
     # `py -0p` 的解析：只认带 * 的默认版本，没 * 就不猜
     _pyout = (" -V:3.14 *        C:\\Python314\\python.exe\n"
               " -V:3.13          C:\\Python313\\python.exe\n")
@@ -2691,7 +2749,13 @@ def self_test():
 
     # py.exe 解析失败必须返回 None（调用方退回 py.exe，最坏只是闪黑框）。
     # 绝不能返回不存在的路径——那会让开机自启直接失效，而且用户看不出来。
-    assert _resolve_py_launcher("C:\\definitely\\not\\exists\\py.exe") is None
+    # （上面已经用假 subprocess 验过两条路径，这里不再真跑外部进程。）
+
+    # 连续失败的两个阈值：太短会误报，太长则用户盯着陈旧数字太久
+    assert 3 <= TICK_FAIL_WARN <= 20, \
+        f"TICK_FAIL_WARN={TICK_FAIL_WARN} 不在合理区间"
+    assert 10 <= TICK_TCL_GIVE_UP <= 600, \
+        f"TICK_TCL_GIVE_UP={TICK_TCL_GIVE_UP} 不在合理区间"
 
     # hibernate() 必须用「休眠」而不是「待机」：SetSuspendState 第一个参数
     # 1=Hibernate、0=Suspend。改成 0 会退化成待机——继续耗电，最终仍然硬关机，
@@ -2854,6 +2918,33 @@ def self_test():
               "</BatteryReport>")
     assert abs(_capacity_from_report_xml(_mixed) - 40.0) < 0.15, \
         f"离谱分段应被丢弃，实际 {_capacity_from_report_xml(_mixed)}"
+
+    # 单块下限：0.5 Wh 是「解析到别的数字」的典型值。
+    # 注意不能只测「单独一块 0.5Wh → None」——那会被总量下限兜住（0.5 < 5.0），
+    # 去掉单块下限照样通过。必须让总量够大，只有「丢弃那一块」才能得到正确结果。
+    assert _capacity_from_report_xml(
+        "<a><FullChargeCapacity>500</FullChargeCapacity></a>") is None, \
+        "单块低于 1Wh 应丢弃"
+    _tiny = ("<BatteryReport>"
+             "<Battery><FullChargeCapacity>40000</FullChargeCapacity></Battery>"
+             "<Battery><FullChargeCapacity>500</FullChargeCapacity></Battery>"
+             "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_tiny) - 40.0) < 0.15, \
+        f"低于 1Wh 的分段应被丢弃，实际 {_capacity_from_report_xml(_tiny)}"
+
+    # 总量上限：5 × 100Wh = 500Wh 超过 PACK_WH_MAX，整包丢弃
+    _five = ("<BatteryReport>"
+             + "<Battery><FullChargeCapacity>100000</FullChargeCapacity></Battery>" * 5
+             + "</BatteryReport>")
+    assert _capacity_from_report_xml(_five) is None, \
+        f"5×100Wh=500Wh 应超上限被丢弃，实际 {_capacity_from_report_xml(_five)}"
+
+    # 4 × 100Wh = 400Wh 正好在上界，必须能读出来（否则上限就设得太紧）
+    _four = ("<BatteryReport>"
+             + "<Battery><FullChargeCapacity>100000</FullChargeCapacity></Battery>" * 4
+             + "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_four) - 400.0) < 0.15, \
+        f"4×100Wh=400Wh 应正好通过，实际 {_capacity_from_report_xml(_four)}"
 
     # 离电时长与周对比
     _d = date(2026, 10, 31)
