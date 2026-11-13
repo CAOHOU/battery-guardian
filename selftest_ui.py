@@ -181,6 +181,19 @@ def run_desktop(root):
     check("显示「无电池」", any("无电池" in t for t in texts), str(texts))
     check("不显示连续天数", not any("连续" in t for t in texts), str(texts))
 
+    # has_battery 缺省时必须按"有电池"处理。缺省成 False 的话，
+    # 笔记本会被判成台式机：百分比消失、显示"无电池"。
+    app.power = {"ac": False, "pct": 80, "secs": None, "charging": False}
+    app.level = "calm"
+    app.render_hud()
+    pump(root, 0.2)
+    texts2 = [app.canvas.itemcget(i, "text")
+              for i in app.canvas.find_all() if app.canvas.type(i) == "text"]
+    check("缺 has_battery 时仍显示百分比",
+          any("80%" in t for t in texts2), str(texts2))
+    check("缺 has_battery 时不显示无电池",
+          not any("无电池" in t for t in texts2), str(texts2))
+
     teardown(app)
     pump(root, 0.2)
 
@@ -202,8 +215,13 @@ def run_hover(root):
 
     check("命中浮条内部", app._pointer_over(cx, cy))
     check("容差内仍算悬停", app._pointer_over(app.hud_x - tol + 1, cy), f"tol={tol}")
-    # 边界：正好等于容差边缘必须算命中（<= 改成 < 会漏掉这一圈）
-    check("容差边界算命中", app._pointer_over(app.hud_x - tol, cy), f"tol={tol}")
+    # 四条边都要测：判定是一行里四个 <=，只测左边会漏掉另外三个
+    check("左边缘算命中", app._pointer_over(app.hud_x - tol, cy), f"tol={tol}")
+    check("右边缘算命中",
+          app._pointer_over(app.hud_x + app.hud_w + tol, cy), f"tol={tol}")
+    check("上边缘算命中", app._pointer_over(cx, app.hud_y - tol), f"tol={tol}")
+    check("下边缘算命中",
+          app._pointer_over(cx, app.hud_y + app.hud_h + tol), f"tol={tol}")
     check("超出容差不算悬停",
           not app._pointer_over(app.hud_x - tol - app.px(5), cy))
 

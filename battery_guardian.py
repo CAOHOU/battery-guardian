@@ -146,6 +146,15 @@ def _clean_secs(secs):
     return secs
 
 
+def _secs_from_raw(raw):
+    """把 GetSystemPowerStatus 的原始 BatteryLifeTime 转成秒数或 None。
+
+    单独抽出来是因为随机变异把这里的 `== NO_TIME` 改成 `!=` 时，
+    没有任何测试会红——而它会让所有正常的剩余时间变成 None。
+    """
+    return _clean_secs(None if raw == NO_TIME else int(raw))
+
+
 def read_power():
     """返回 {ac, pct, secs, charging, has_battery}，读不到返回 None。"""
     st = _SYSTEM_POWER_STATUS()
@@ -159,8 +168,7 @@ def read_power():
     if pct is not None and not (0 <= pct <= 100):
         pct = None                                     # 防御：越界一律当未知
 
-    secs = None if st.BatteryLifeTime == NO_TIME else int(st.BatteryLifeTime)
-    secs = _clean_secs(secs)
+    secs = _secs_from_raw(st.BatteryLifeTime)
 
     return {
         "ac": st.ACLineStatus == 1,
@@ -1861,6 +1869,12 @@ def self_test():
     assert _clean_secs(3600) == 3600, "正常值应原样保留"
     assert _clean_secs(48 * 3600) == 48 * 3600, "边界值应保留"
 
+    # 原始值 → 秒数：哨兵必须变 None，正常值必须留着。
+    # 这里 `== NO_TIME` 被改成 `!=` 时，所有正常剩余时间都会消失。
+    assert _secs_from_raw(NO_TIME) is None, "0xFFFFFFFF 应视为未知"
+    assert _secs_from_raw(3600) == 3600, "3600 秒应原样保留"
+    assert _secs_from_raw(0) is None, "0 秒应视为未知"
+
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {
         "kwh": 0.0, "wear": 0.0,
@@ -1880,6 +1894,14 @@ def self_test():
     })()
     assert App.sub_text(nb) != "未接电", \
         f"缺 has_battery 时不应判为无电池，实际 {App.sub_text(nb)}"
+
+    # chip_text 也要看 has_battery：缺省成 False 会把连续天数整段吞掉
+    nb_chip = type("S", (), {
+        "power": {"ac": False, "pct": 80, "secs": None},
+        "stats": {"streak_days": 3},
+    })()
+    assert App.chip_text(nb_chip) != "", \
+        "缺 has_battery 时不应丢掉连续天数"
 
     print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、"
           "阈值顺序、静音不关保底层、连续天数、明早时长、账本全部通过")
