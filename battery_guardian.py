@@ -22,6 +22,7 @@ import contextlib
 import ctypes
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -43,7 +44,7 @@ APP_NAME = "电量守护"
 # ---- 元信息：单一来源 ----------------------------------------------------
 # 改这里就够了。build_exe.bat 会读这几个常量自动生成 version_info.txt，
 # 让 exe 属性里的「公司 / 版权 / 版本」跟源码保持一致。
-__version__ = "1.1"
+__version__ = "1.1.1"
 __author__ = "CAOHOU"
 __license__ = "MIT"
 __year__ = "2026"
@@ -603,6 +604,26 @@ def isolated_data(prefix="bg-test-"):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _clean_amount(v, default=0.0):
+    """把累计量洗成「有限、非负」的数。脏值一律回落 default。
+
+    为什么不能只判 `isinstance(v, (int, float))`：`float("nan")` 和
+    `float("inf")` 都能通过类型判定。于是 stats.json 里被写成 `NaN` 的
+    `kwh` 会一路活到账本，`summary()` 里 `saved` 变成 nan，界面显示 "nan 元"；
+    `days` 里的 `-999` 同样合法（`float()` 对负数成功），周对比会显示负数。
+
+    这些值全是累加器（省了多少 kWh、折算多少电池损耗、当天用了多少），
+    物理上不可能为负，所以下限 0 不是猜测而是定义。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(f) or f < 0:
+        return default
+    return f
+
+
 def load_stats():
     st = _load_json(STATS_PATH, default_stats())
     if not isinstance(st, dict):
@@ -620,23 +641,27 @@ def load_stats():
         # 然后被 tick 兜住 → 显示「电量读取失败」（把数据问题报成硬件问题）。
         clean_days = {}
         for k, v in st["days"].items():
-            try:
-                clean_days[str(k)] = float(v)
-            except (TypeError, ValueError):
+            val = _clean_amount(v, None)
+            if val is None:              # 非数字 / NaN / inf / 负数
                 continue
+            clean_days[str(k)] = val
         st["days"] = clean_days
     for k in ("streak_days", "incidents"):
         v = st.get(k)
         if not isinstance(v, int) or isinstance(v, bool):
             st[k] = d[k]
     for k in ("kwh", "wear"):
-        v = st.get(k)
-        if not isinstance(v, (int, float)) or isinstance(v, bool):
-            st[k] = d[k]
+        st[k] = _clean_amount(st.get(k), d[k])
     if not isinstance(st.get("today"), dict):
         st["today"] = dict(d["today"])
     if st["today"].get("date") != str(date.today()):
         st["today"] = {"date": str(date.today()), "kwh": 0.0, "wear": 0.0}
+    # today 的内层值同样要洗：只校验 date 是不够的。
+    # `{"date":今天,"kwh":"oops"}` 能通过上面两道检查，然后
+    # Ledger.summary() 里 `"oops" * 0.6` 抛 TypeError，
+    # 用户双击浮条打开账本就是一次崩溃。
+    for k in ("kwh", "wear"):
+        st["today"][k] = _clean_amount(st["today"].get(k), 0.0)
     return st
 
 
@@ -1928,6 +1953,18 @@ class App:
             # 曾加过 5 分钟去抖，理由是「插头接触不良会反复跳 ac」——
             # 后来确认那三次是用户主动插拔测试，不是接触不良，已撤销。
             self._incident_flag = False
+            # 休眠失败标志也必须跟着复位。
+            # 只复位 _incident_flag 是个漏洞：一次瞬时失败（系统禁用休眠、
+            # 权限不足）之后，即使用户插电、系统恢复了休眠能力、再拔电到 8%，
+            # 倒计时也不会再开——L6 在本进程余生永久失效，而开机自启让它
+            # 7×24 常驻。静音菜单还会一直置灰（见 _mute_menu_state），
+            # 连逃生口都少一个。最终结果是硬关机，正好是 L6 存在的理由。
+            # 「失败后不重试」的本意是别每 65 秒响一次，不是永久放弃；
+            # 插一次电就构成一次新的尝试周期，所以在这里复位是对的。
+            if self._hibernate_failed:
+                self._hibernate_failed = False
+                self._close_fail_win()
+                log("已插电，保底层恢复（下次低电量仍会尝试休眠）")
             self._mark_clean_day()
         else:
             self._handle_escalation(now)
@@ -2273,7 +2310,8 @@ class App:
                  font=self.f_title, anchor="w").pack(fill="x")
         tk.Label(wrap,
                  text="系统没有接受休眠请求（可能禁用了休眠）。\n"
-                      "不会再重试，也不会再响。请自己保存工作并插电。",
+                      "这一轮不会再重试，也不会再响。请自己保存工作并插电。\n"
+                      "插电后保底层会自动恢复。",
                  bg=C["surface_soft"], fg=C["muted"], font=self.f_txt,
                  anchor="w", justify="left",
                  wraplength=self.px(340)).pack(fill="x", pady=(self.px(8), self.px(14)))
@@ -3395,6 +3433,36 @@ def _self_test_body():
     assert isinstance(st_bad["incidents"], int), st_bad["incidents"]
     assert isinstance(st_bad["today"], dict) and "date" in st_bad["today"], \
         st_bad["today"]
+
+    # 只校验 today 是 dict、date 对得上还不够：内层值可以是字符串。
+    # 独立全项目审查 P1-1：`{"date":今天,"kwh":"oops"}` 能过上面所有检查，
+    # 然后在 Ledger.summary() 里 `"oops" * 0.6` 抛 TypeError，
+    # 用户双击浮条打开账本就是一次崩溃。
+    _save_json(STATS_PATH, {"today": {"date": str(date.today()),
+                                      "kwh": "oops", "wear": 0},
+                            "days": {str(date.today()): -999,
+                                     "2026-01-01": "nan", "2026-01-02": float("inf")},
+                            "kwh": float("nan"), "wear": float("inf"),
+                            "streak_days": 0, "incidents": 0})
+    st_dirty = load_stats()
+    assert st_dirty["today"]["kwh"] == 0.0, st_dirty["today"]
+    assert st_dirty["today"]["wear"] == 0.0, st_dirty["today"]
+    assert str(date.today()) not in st_dirty["days"], \
+        f"负数离电时长应被丢弃：{st_dirty['days']}"
+    assert "2026-01-01" not in st_dirty["days"], \
+        f"NaN 离电时长应被丢弃：{st_dirty['days']}"
+    assert "2026-01-02" not in st_dirty["days"], \
+        f"inf 离电时长应被丢弃：{st_dirty['days']}"
+    assert st_dirty["kwh"] == 0.0, st_dirty["kwh"]
+    assert st_dirty["wear"] == 0.0, st_dirty["wear"]
+    # 真正的验收标准不是"字段被洗干净"，而是"消费者不再崩"。
+    # 断言清洗后的值只是手段，这里直接跑一遍账本。
+    _summary = Ledger(default_config(), st_dirty).summary()
+    assert isinstance(_summary["saved"], float) and math.isfinite(_summary["saved"]), \
+        _summary
+    _wk = weekly_on_battery(st_dirty)
+    assert all(v is not None and math.isfinite(v) and v >= 0 for v in _wk), _wk
+
     print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、"
           "阈值顺序、静音不关保底层、连续天数、明早时长、账本、"
           "电池容量解析、离电时长周对比、日志轮转全部通过")

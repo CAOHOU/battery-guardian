@@ -9,6 +9,7 @@
 每次都从默认值开始，避免上一轮状态污染下一轮。
 """
 import ctypes
+import io
 import os
 import sys
 import tempfile
@@ -21,6 +22,21 @@ import battery_guardian as bg
 
 FAILS = []
 SOUNDS = []          # 收集 play_alert 的调用，测试期间不真的响
+STAGES = []          # 已执行的阶段名，用来让「半途夭折」和「跑完有失败」可区分
+
+
+def on_callback_exception(*exc_info):
+    """Tk 回调里的异常必须计入 FAILS，不能只打印。
+
+    独立全项目审查 P1-2：原来这里挂的是
+        lambda *a: traceback.print_exception(*a)
+    于是 `after` 回调里抛的异常完全不影响退出码——单条跑
+    `python selftest_ui.py` 得到 rc=0、末行「全部通过」，FAILS 还是空的。
+    统一门禁靠禁止词 Traceback 兜住了，但 README 和交接说明都允许单条跑，
+    所以这条假绿在门禁之外是真实存在的。
+    """
+    traceback.print_exception(*exc_info)
+    FAILS.append("Tk 回调异常")
 
 
 def pump(root, sec=0.7):
@@ -82,6 +98,7 @@ def teardown(app):
 
 
 def stage(title):
+    STAGES.append(title)
     print(f"\n[{title}]")
 
 
@@ -777,6 +794,38 @@ def run_tick_resilience(root):
     pump(root, 0.2)
 
 
+def run_callback_error_hook(root):
+    """回调异常必须能把整条命令变红（独立全项目审查 P1-2）。
+
+    这里只验两件可静态断言的事：钩子确实记进 FAILS、root 确实挂的是它。
+    不在这里真的制造一次 Tk 回调异常——那会让套件自己判失败，
+    真正的端到端验证靠手工注入（改一行 selftest_ui 加一个抛异常的 after，
+    跑 `python selftest_ui.py` 应当 rc=1 而不是「全部通过」）。
+    """
+    stage("回调异常计入失败")
+    check("root 挂的是计入 FAILS 的钩子",
+          root.report_callback_exception is on_callback_exception)
+    before = len(FAILS)
+    # 探针的堆栈必须接住，不能漏到 stdout/stderr：
+    # run_all.py 的禁止词表含 "Traceback"，漏出去会让整条门禁变红
+    # ——那是门禁在正常履职，不是 bug，所以测试要自己把噪音收干净。
+    buf = io.StringIO()
+    old_err = sys.stderr
+    sys.stderr = buf
+    try:
+        try:
+            raise RuntimeError("探针")
+        except RuntimeError:
+            on_callback_exception(*sys.exc_info())
+    finally:
+        sys.stderr = old_err
+    check("回调异常计入 FAILS", len(FAILS) == before + 1, str(FAILS[before:]))
+    check("回调异常仍然打印堆栈（只是被测试接住）",
+          "探针" in buf.getvalue(), buf.getvalue()[:80])
+    # 探针自己留下的记录要清掉，否则整条套件被自己判失败
+    del FAILS[before:]
+
+
 def run_demo_no_persist():
     """演示模式不能往真实 stats/config 写东西。
 
@@ -893,6 +942,35 @@ def run_hibernate_failed(root):
         pump(root, 0.2)
         check("失败后不再重开保底层", app.failsafe_win is None)
         check("失败后不再响保底层提示音", SOUNDS == [], str(SOUNDS))
+
+        # ---- 独立全项目审查 P0-1：失败标志必须能被插电复位 ----
+        # 旧实现只复位 _incident_flag，漏了 _hibernate_failed。后果是：
+        # 一次瞬时失败之后，用户插电、系统恢复休眠能力、再拔电到 8%，
+        # 倒计时也不开 —— L6 在本进程余生永久失效，而开机自启让它 7×24
+        # 常驻。静音菜单还一直置灰，逃生口跟着少一个。最终是硬关机。
+        orig_rp = bg.read_power
+        try:
+            # 约定：开保底层的用例一律把倒计时拉长，防止测试机慢时真的休眠
+            app.cfg["fail_safe_countdown"] = 999
+            app.demo_pct = None
+            bg.read_power = lambda: {"ac": True, "pct": 5, "secs": None,
+                                     "charging": True, "has_battery": True}
+            app._tick_once()
+            pump(root, 0.2)
+            check("插电后休眠失败标志复位", app._hibernate_failed is False)
+            check("插电后失败提示窗关闭", app.fail_win is None)
+            check("插电后静音菜单恢复可点", app._mute_menu_state() == "normal")
+
+            # 再拔电回到低电量，保底层必须重开倒计时
+            del SOUNDS[:]
+            bg.read_power = lambda: {"ac": False, "pct": 5, "secs": None,
+                                     "charging": False, "has_battery": True}
+            app._tick_once()
+            pump(root, 0.3)
+            check("插电恢复后低电量重开保底层", app.failsafe_win is not None)
+            check("重开保底层会重新响铃", SOUNDS != [], str(SOUNDS))
+        finally:
+            bg.read_power = orig_rp
     finally:
         bg.hibernate = orig_hib
         app._close_fail_win()
@@ -1025,7 +1103,7 @@ def _main_body(tmp):
 
     root = tk.Tk()
     root.withdraw()
-    root.report_callback_exception = lambda *a: traceback.print_exception(*a)
+    root.report_callback_exception = on_callback_exception
 
     run(root, 80, "right")
     run(root, 80, "left")
@@ -1054,12 +1132,16 @@ def _main_body(tmp):
     run_measured_prefix(root)
     run_claim_logging(root)
     run_tick_resilience(root)
+    run_callback_error_hook(root)
     run_demo_no_persist()
 
     root.destroy()
 
     print()
     print("=" * 60)
+    # 覆盖汇总：让「半途夭折」和「全跑完但有 1 项失败」在输出里可区分。
+    # 只打分组名不校验条数时，少跑一组和全跑完长得一样。
+    print(f"已执行 {len(STAGES)} 个阶段")
     if FAILS:
         print(f"失败 {len(FAILS)} 项：{', '.join(FAILS)}")
         sys.exit(1)

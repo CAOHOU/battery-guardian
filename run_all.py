@@ -31,9 +31,25 @@ def sha(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def real_data_dir():
+    """真实数据目录，必须用产品自己的选址逻辑。
+
+    原来这里是 `os.environ.get("LOCALAPPDATA", "")` 自己拼路径。
+    独立全项目审查 P1-3 指出后果：环境里没有 LOCALAPPDATA 时（CI、精简
+    shell、服务账户），拼出来是相对路径 `BatteryGuardian/data`，目录不存在
+    → data_snapshot() 返回 None → `safe = (before is None or ...)` 为真
+    → 门禁打印「PASS 真实 data/ 未变 无该目录」并 rc=0。
+    也就是说这条判据在那种环境里**根本没执行**，却计入通过。
+    而产品自己的 `_app_data_root()` 会回退到 USERPROFILE\\AppData\\Local，
+    能找到真实目录——同一个坑 selftest_verify.py 早就踩过并改掉了。
+    """
+    sys.path.insert(0, HERE)
+    from battery_guardian import _app_data_root
+    return os.path.join(_app_data_root(), "BatteryGuardian", "data")
+
+
 def data_snapshot():
-    p = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                     "BatteryGuardian", "data")
+    p = real_data_dir()
     if not os.path.isdir(p):
         return None
     return {n: sha(os.path.join(p, n))
@@ -59,6 +75,7 @@ def commands(skip_mut):
 
 def main():
     skip_mut = "--skip-mutations" in sys.argv
+    allow_no_data = "--allow-no-data-dir" in sys.argv
     src_before = sha(SRC)
     lines_before = len(open(SRC, encoding="utf-8").readlines())
     data_before = data_snapshot()
@@ -97,11 +114,27 @@ def main():
     print(f"  {'PASS' if restored else 'FAIL'}  源码已还原        "
           f"sha={src_before[:8]}→{src_after[:8]} 行数={lines_before}→{lines_after}")
 
-    # 真实数据目录不能被任何一条命令改写
+    # 真实数据目录不能被任何一条命令改写。
+    # 三种情况分开判，别用一个 `or` 把「没查」混成「通过」：
+    #   1. 前后都不存在        → 全新机器，判据无法执行（默认判红，可显式豁免）
+    #   2. 跑之前不存在、跑之后出现 → 有命令在写真实目录，直接红
+    #   3. 都存在              → 逐文件 hash 比对
     data_after = data_snapshot()
-    safe = (data_before is None or data_before == data_after)
-    print(f"  {'PASS' if safe else 'FAIL'}  真实 data/ 未变    "
-          f"{'无该目录' if data_before is None else '逐文件 hash 一致' if safe else '内容发生变化'}")
+    if data_before is None and data_after is None:
+        if allow_no_data:
+            safe = True
+            data_note = "目录不存在（已用 --allow-no-data-dir 豁免）"
+        else:
+            safe = False
+            data_note = "目录不存在，判据未执行（全新机器可加 --allow-no-data-dir）"
+    elif data_before is None:
+        safe = False
+        data_note = (f"跑之前不存在，跑之后出现 {len(data_after)} 个文件"
+                     f" —— 有命令在写真实目录")
+    else:
+        safe = (data_before == data_after)
+        data_note = "逐文件 hash 一致" if safe else "内容发生变化"
+    print(f"  {'PASS' if safe else 'FAIL'}  真实 data/ 未变    {data_note}")
 
     print("=" * 70)
     all_ok = all(r[1] for r in results) and restored and safe
