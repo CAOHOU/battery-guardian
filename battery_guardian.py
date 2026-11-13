@@ -496,6 +496,67 @@ def play_alert(kind):
         return False
 
 
+# ---------------------------------------------------------------- 开机自启
+
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "BatteryGuardian"
+
+
+def _autostart_command():
+    """开机自启要执行的命令。
+
+    exe 版直接指向 exe；源码版指向 pythonw + 脚本（用 pythonw 才不会闪黑框）。
+    路径必须加引号——这台机器的目录里就有空格。
+    """
+    if FROZEN:
+        return f'"{sys.executable}"'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pyw):
+        pyw = sys.executable
+    script = os.path.join(APP_HOME, "battery_guardian.py")
+    return f'"{pyw}" "{script}"'
+
+
+def autostart_enabled():
+    """读注册表判断是否已开启。读不到一律当没开。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
+            try:
+                val, _ = winreg.QueryValueEx(k, AUTOSTART_NAME)
+                return bool(val)
+            except FileNotFoundError:
+                return False
+    except Exception:
+        return False
+
+
+def set_autostart(on):
+    """写 / 删 HKCU 的 Run 项。返回是否成功。
+
+    只用 HKCU，不碰 HKLM：不需要管理员权限，卸载时删掉值就干净了。
+    """
+    try:
+        import winreg
+        if on:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
+                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  _autostart_command())
+            log("已开启开机自启")
+        else:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY,
+                                0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, AUTOSTART_NAME)
+            log("已关闭开机自启")
+        return True
+    except FileNotFoundError:
+        # 关的时候值本来就不存在，算成功
+        return True
+    except Exception as e:
+        log(f"设置开机自启失败：{e!r}")
+        return False
+
+
 def log(msg):
     try:
         _ensure_dirs()
@@ -777,6 +838,10 @@ class App:
         self.menu.add_command(label="安静到明早", command=self._mute_until_morning)
         self._menu_morning_idx = self.menu.index("end")
         self.menu.add_separator()
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
+        self.menu.add_checkbutton(label="开机自启", variable=self.autostart_var,
+                                  command=self._toggle_autostart)
+        self.menu.add_separator()
         self.menu.add_command(label=f"关于 {APP_NAME}", command=self.open_about)
         self.menu.add_command(label="退出", command=self.quit)
 
@@ -1014,6 +1079,20 @@ class App:
 
     def _mute_until_morning(self):
         self.mute(minutes_until_morning())
+
+    def _toggle_autostart(self):
+        """右键菜单里的开机自启开关。
+
+        演示模式不碰注册表——截图、调界面不该在系统里留下东西。
+        失败时把勾选状态回滚成真实状态，别让菜单骗人。
+        """
+        want = bool(self.autostart_var.get())
+        if self.demo:
+            self.autostart_var.set(autostart_enabled())
+            log("演示模式：不修改开机自启")
+            return
+        if not set_autostart(want):
+            self.autostart_var.set(autostart_enabled())
 
     def _morning_menu_state(self):
         """「安静到明早」在低电量时应置灰。
@@ -2196,6 +2275,91 @@ def self_test():
     assert App._morning_menu_state(_mm(31))[0] == "normal"
     assert App._morning_menu_state(_mm(5, ac=True))[0] == "normal", "插电时不该置灰"
     assert App._morning_menu_state(_mm(None))[0] == "normal", "电量未知时不该置灰"
+
+    # 开机自启：读写删都要对，而且**绝不碰真实注册表**——用假 winreg 模块
+    cmd = _autostart_command()
+    assert cmd.startswith('"'), f"命令必须带引号（目录里有空格）：{cmd}"
+    assert cmd.count('"') >= 2, cmd
+
+    class _Key:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _FakeWinreg:
+        HKEY_CURRENT_USER = 1
+        REG_SZ = 1
+        KEY_SET_VALUE = 2
+
+        def __init__(self):
+            self.data = {}
+
+        def OpenKey(self, root, path, *a):
+            if path not in self.data:
+                raise FileNotFoundError(path)
+            return _Key(path)
+
+        def CreateKey(self, root, path):
+            self.data.setdefault(path, {})
+            return _Key(path)
+
+        def QueryValueEx(self, key, name):
+            d = self.data.get(key.path, {})
+            if name not in d:
+                raise FileNotFoundError(name)
+            return d[name], 1
+
+        def SetValueEx(self, key, name, reserved, typ, value):
+            self.data.setdefault(key.path, {})[name] = value
+
+        def DeleteValue(self, key, name):
+            d = self.data.get(key.path, {})
+            if name not in d:
+                raise FileNotFoundError(name)
+            del d[name]
+
+    _saved_reg = sys.modules.get("winreg")
+    _fr = _FakeWinreg()
+    sys.modules["winreg"] = _fr
+    try:
+        assert autostart_enabled() is False, "初始应为未开启"
+        assert set_autostart(True) is True
+        assert autostart_enabled() is True
+        assert _fr.data[AUTOSTART_KEY][AUTOSTART_NAME] == _autostart_command()
+        assert set_autostart(False) is True
+        assert autostart_enabled() is False
+        assert set_autostart(False) is True, "重复关闭不该报错"
+
+        # 演示模式绝不能写注册表
+        class _Var:
+            def __init__(self, v):
+                self.v = v
+
+            def get(self):
+                return self.v
+
+            def set(self, v):
+                self.v = v
+
+        calls = []
+        _orig_set = globals()["set_autostart"]
+        globals()["set_autostart"] = lambda on: calls.append(on) or True
+        try:
+            stub = type("A", (), {"demo": True, "autostart_var": _Var(True)})()
+            App._toggle_autostart(stub)
+            assert calls == [], "演示模式不能写注册表"
+        finally:
+            globals()["set_autostart"] = _orig_set
+    finally:
+        if _saved_reg is None:
+            sys.modules.pop("winreg", None)
+        else:
+            sys.modules["winreg"] = _saved_reg
 
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {
