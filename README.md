@@ -184,9 +184,12 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
 **实测（本机）**
 
 - 源码运行：浮条四档状态（已接电 / 45% / 15% / 5%）、确认框、休眠倒计时、账本、L4 横幅
-- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，连续 **10 轮** `selftest_ui.py` 全通过
+- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **171 项断言**，连续多轮全通过
 - 自动收起：启动 5 秒宽限期后，鼠标不在浮条上会自行收成彩条
 - exe：`--where` / `--once` / `--self-test` 与 GUI 启动、自动收起、确认框、窗口图标
+- **打包流程不碰用户数据**：`selftest_verify.py` 造一个假 app_home 跑一遍 `verify_exe.py`，
+  断言 `config.json` / `stats.json` 仍在、真实 `data/` 的 mtime 与文件列表都没变
+- **变异验收**：三套脚本（`_mutcheck_round2/3/4.py`）共 35 项「故意改坏」，全部能被测试抓到
 
 **模拟验证（不需要第二台机器）**
 
@@ -214,7 +217,7 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
   也没有第二台机器。依赖审计把风险压低了，但没有替代真机验证。
 - **真实多显示器**：需要两块物理屏；代码目前只取主屏尺寸，这一条是已知限制而非待验证项。
 
-开发过程中修掉的六个真实缺陷（记录在案，便于复查）：
+开发过程中修掉的九个真实缺陷（记录在案，便于复查）：
 
 1. hover 循环每 120ms 调一次 `collapse()`，而滑动动画需要 135ms，原实现每次都重启动画，
    导致最后一帧永远走不到、`_animating` 卡在 `True`，浮条从此再也收不起来。
@@ -231,6 +234,19 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
 6. **阈值不做顺序校验。** 只把每个阈值单独夹到 0–100，`fail_safe` 手改成 50 时
    45% 就会落进保底层 → 高电量自动休眠。现在按 hint ≥ nudge ≥ dialog ≥ cost ≥ fail_safe
    逐级夹取。
+7. **打包验证会删掉整个数据目录。** `verify_exe.py` 为了「从干净的 cli.log 开始」，
+   对 `%LOCALAPPDATA%\BatteryGuardian\data\cli.log` 做了两次 `dirname` —— 正好是整个
+   `BatteryGuardian` 目录，于是每打一次包就把 `config.json` / `stats.json` 一起删掉，
+   `ignore_errors=True` 让它完全静默。现在改成把子进程的 `LOCALAPPDATA` 指到临时目录，
+   与真实数据物理隔离。
+8. **主循环没有异常保护。** `tick()` 最后那句 `after` 是循环唯一的续命动作，任何异常
+   跳过它，循环就永久停止——浮条不刷新、确认框不弹、**保底层不触发**，且没有任何提示。
+   开机自启让它变成 7×24 长期运行之后，这从理论风险变成迟早发生。
+9. **`TclError` 是唯一不重排的分支。** 上一版对 `TclError` 直接 `return`，而它恰好是
+   注释里写下的「加这个保护的主要动机」（RDP 重连 / 显示器切换）。现在改成记日志后
+   照常重排；真销毁时下面那句 `after` 自己会抛 `TclError` 并被吞掉，循环自然终止。
+   顺带加了「连续失败 6 次就让浮条改口说『电量读取失败』」——一个还在动但已经瞎了的
+   工具，比直接死掉更难被发现。
 
 这些都是自动化测试跑出来的，肉眼点几下发现不了。
 
@@ -249,6 +265,10 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
 
 它反映的是「**按你刚才的用法还能撑多久**」，不是「这台机器还能用多久」。
 同一块电池，写代码和看视频能差三倍，所以区间比单值诚实。
+
+**如果连续 6 次读不到电量**（约 30 秒），浮条会改口显示「电量读取失败」。
+这是刻意的：一个还在刷新、但数据其实已经陈旧不动的浮条，比直接死掉更难被发现。
+恢复读取后它会自己回到正常文案，日志里也会记一行「恢复正常」。
 
 > 早期版本允许多开，两个实例各算各的速率，屏幕上会出现「43% 约 110 分钟」和
 > 「43% 约 172 分钟」两个互相打架的数字。现在加了单实例保护，重复启动只会弹一个提示。
@@ -329,17 +349,22 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
 ## 测试
 
 ```bash
-# 无界面自检：等级判定、速率估算、账本算法
+# 无界面自检：等级判定、速率估算、容量解析、账本算法、周对比、日志轮转
 python battery_guardian.py --self-test
 
-# 界面冒烟测试：吸附 / 收起 / 展开 / 固定 / 拖离，会真的开窗口，跑完自动关
+# 界面冒烟测试：吸附 / 收起 / 展开 / 固定 / 拖离 / 提示音 / 主循环韧性
 python selftest_ui.py
 
 # 布局矩阵：12 种屏幕尺寸 × DPI 组合，检查越界与贴边精度
 python selftest_layout.py
+
+# 打包验证的数据安全：verify_exe.py 不得碰真实 data/（会真跑一次 exe）
+python selftest_verify.py
 ```
 
-两个测试脚本都会把配置写到临时目录，不会碰你真实的 `data/`。
+前三个脚本都会把配置写到临时目录，不会碰你真实的 `data/`。
+`selftest_verify.py` 更进一步：它连子进程的 `LOCALAPPDATA` 都指向临时目录，
+并反向断言真实 `data/` 的 mtime 与文件列表没变。
 
 调试用的参数：
 
@@ -359,8 +384,10 @@ python selftest_layout.py
 ```
 battery-guardian/
   battery_guardian.py   全部逻辑，单文件
-  selftest_ui.py        界面冒烟测试（吸附 / 收起 / 固定）
-  selftest_layout.py    布局矩阵测试（屏幕尺寸 × DPI）
+  selftest_ui.py        界面冒烟测试（171 项断言）
+  selftest_layout.py    布局矩阵测试（12 种屏幕 × DPI）
+  selftest_verify.py    打包验证不得碰真实数据
+  verify_exe.py         打包后自动验证 exe（build_exe.bat 调用）
   启动.bat              源码方式启动（自动找带 tkinter 的 Python）
   build_exe.bat         打包成单文件 exe
   gen_version_info.py   从源码元信息生成 exe 版本资源（打包时自动调用）

@@ -103,7 +103,10 @@ rem 所以每次打包都真跑一次 --self-test，超时即失败。
 if errorlevel 1 (
   echo.
   echo [ERROR] exe verification failed.
-  pause
+  rem 不用 pause：脚本被自动调用时会永久挂住，看不出是失败还是卡死。
+  rem 给 15 秒窗口让双击的人看清错误，然后自己退出。
+  echo Exiting in 15 seconds...
+  "%SystemRoot%\System32\timeout.exe" /t 15 >nul 2>nul
   exit /b 1
 )
 

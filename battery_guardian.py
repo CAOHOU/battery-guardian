@@ -183,7 +183,12 @@ def _capacity_from_report_xml(xml_text):
         return None
 
     # 没有 <Battery> 段就退化成全文搜索（某些版本或精简报告可能没有分段）
-    blocks = re.findall(r"<Battery>(.*?)</Battery>", xml_text, re.S) or [xml_text]
+    # 分段正则也要容忍属性：`<Battery id="BAT1">`。否则两块 40 Wh 会退化成 40 Wh
+    # （只匹配到第一段之后的裸标签全都不中，最后走全文回退只取第一个）。
+    # 当前 powercfg 输出的是裸 `<Battery>`，但同一个文件里容量标签已经支持属性了，
+    # 两处写法不一致本身就是隐患。
+    blocks = re.findall(r"<Battery(?:\s[^>]*)?>(.*?)</Battery>",
+                        xml_text, re.S) or [xml_text]
 
     def pick(tag, text):
         m = _CAP_TAG_RE[tag].search(text)
@@ -198,14 +203,16 @@ def _capacity_from_report_xml(xml_text):
     total_mwh = 0.0
     for blk in blocks:
         mwh = pick("FullChargeCapacity", blk) or pick("DesignCapacity", blk)
-        if mwh:
+        # 单块先各自校验：一个离谱的分段不该把整台机器的容量算飞，
+        # 也不该因为它让另外几块被一起丢掉。
+        if mwh and 1_000 <= mwh <= 200_000:
             total_mwh += mwh
     if total_mwh <= 0:
         return None
 
     wh = total_mwh / 1000.0
-    # 笔记本电池实际在 20-150 Wh 之间；超出这个量级说明解析到了别的数字
-    if not (5.0 <= wh <= 300.0):
+    # 总量再兜一次，比单块宽：三块 100 Wh 的移动工作站也要能读出来
+    if not (5.0 <= wh <= 400.0):
         return None
     return round(wh, 1)
 
@@ -229,7 +236,8 @@ def read_battery_capacity_wh(timeout=POWERCAP_TIMEOUT):
         pass
     try:
         subprocess.run(["powercfg", "-batteryreport", "-output", path, "-xml"],
-                       capture_output=True, timeout=timeout)
+                       capture_output=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL)
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -338,7 +346,8 @@ def hibernate():
     except Exception:
         pass
     try:
-        r = subprocess.run(["shutdown", "/h"], capture_output=True, timeout=10)
+        r = subprocess.run(["shutdown", "/h"], capture_output=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
         return r.returncode == 0
     except Exception:
         return False
@@ -563,6 +572,10 @@ def load_stats():
 
 MAX_HISTORY_DAYS = 21
 
+# 连续多少次 tick 失败之后，界面上要说实话。
+# 6 次 × 默认 5 秒 = 30 秒：短到用户还在这台机器前，长到不会被一次抖动触发。
+TICK_FAIL_WARN = 6
+
 
 def record_on_battery(stats, seconds, today=None):
     """把「离电秒数」记到当天，并只保留最近 21 天。
@@ -661,40 +674,63 @@ AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_NAME = "BatteryGuardian"
 
 
+def _parse_py_launcher_output(text):
+    """从 `py -0p` 的输出里挑出默认解释器路径。
+
+    输出形如：
+
+        -V:3.14 *        C:\\...\\Python314\\python.exe
+        -V:3.13          C:\\...\\Python313\\python.exe
+
+    带 `*` 的是默认版本。**没有 `*` 就返回 None，不猜**——猜错的代价是
+    把开机自启指向一个非默认版本，用户下次开机用的解释器跟他预期的不一样。
+    抽成纯函数是为了能直接喂文本测，不用真跑 py.exe。
+    """
+    for line in text.splitlines():
+        if "*" not in line:
+            continue
+        m = re.search(r"([A-Za-z]:\\[^\r\n]*?python\.exe)", line, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def _resolve_py_launcher(exe=None):
     """`py.exe` 是启动器（控制台程序），问它真实解释器在哪。
 
     用 `py -0p` 列出已安装版本，带 `*` 的那行是默认版本。
     解析失败一律返回 None —— 调用方保持原样（退回 py.exe，最坏只是闪一下黑框），
     绝不能因为解析出错把自启指向一个不存在的路径，那样开机根本起不来。
+
+    timeout 只给 3 秒：这个调用发生在 UI 线程上（点菜单 → 写注册表 → 拼命令），
+    `py -0p` 本身是瞬时的，给 10 秒只会让界面在异常情况下白冻 10 秒。
     """
     exe = exe or sys.executable
     try:
-        r = subprocess.run([exe, "-0p"], capture_output=True, timeout=10)
+        r = subprocess.run([exe, "-0p"], capture_output=True, timeout=3,
+                           stdin=subprocess.DEVNULL)
         text = (r.stdout or b"").decode("utf-8", "ignore")
     except Exception:
         return None
 
-    for line in text.splitlines():
-        if "*" not in line:
-            continue
-        m = re.search(r"([A-Za-z]:\\[^\r\n]*?python\.exe)", line, re.I)
-        if m:
-            cand = m.group(1).strip()
-            if os.path.exists(cand):
-                return cand
-    return None
+    cand = _parse_py_launcher_output(text)
+    # 存在性检查留在这一层：纯函数只负责"输出里写了什么"，
+    # "那个文件还在不在"是环境事实，两者混在一起就没法单独测解析了。
+    return cand if cand and os.path.exists(cand) else None
 
 
-def _autostart_command():
+def _autostart_command(exe=None):
     """开机自启要执行的命令。
 
     exe 版直接指向 exe；源码版指向 pythonw + 脚本（用 pythonw 才不会闪黑框）。
     路径必须加引号——这台机器的目录里就有空格。
+
+    `exe` 参数是为了测试注入：自检不该去改 `sys.executable`——
+    在 PyInstaller onefile 下那个值是运行时自己用的，改它风险远大于收益。
     """
+    exe = exe or sys.executable
     if FROZEN:
-        return f'"{sys.executable}"'
-    exe = sys.executable
+        return f'"{exe}"'
     # `py -3 xxx.py` 启动时 sys.executable 是 py.exe（控制台程序），
     # 它旁边没有 pythonw.exe，直接拼出来的命令会在登录时闪一个黑框。
     if os.path.basename(exe).lower() == "py.exe":
@@ -962,6 +998,8 @@ class App:
         # 变成「每 65 秒响一次、关不掉」的无限循环。
         self._hibernate_failed = False
         self._last_tick = time.time()
+        # 连续 tick 失败次数：到 TICK_FAIL_WARN 就让浮条承认「读不到电量」
+        self._tick_fails = 0
 
         # 账本默认 60Wh 只是占位符，和真机容量能差 40%。用户没填过时后台读一次
         # 本机真实容量——放线程里，别让 2 秒的 powercfg 卡住启动。
@@ -1484,6 +1522,11 @@ class App:
         self.root.after(760, self._pulse_loop)
 
     def sub_text(self):
+        # 连续失败够久就别再装作在读数——浮条还"活着"但数据已经陈旧，
+        # 这是比直接死掉更糟的状态：用户以为它在工作。
+        # getattr 是为了兼容自检里那些只带 power/level 的 stub。
+        if getattr(self, "_tick_fails", 0) >= TICK_FAIL_WARN:
+            return "电量读取失败"
         pct = self.power["pct"]
         if not self.power.get("has_battery", True):
             return "已接电" if self.power["ac"] else "未接电"
@@ -1571,16 +1614,40 @@ class App:
             return
         try:
             self._tick_once()
-        except tk.TclError:
-            # 窗口正在销毁（退出或注销），没必要再排下一次
-            return
+        except tk.TclError as e:
+            # TclError 分两种，不能一刀切 return：
+            #  - 瞬时（RDP 重连、显示器切换）→ 应该重排，让它自己恢复；
+            #  - 真销毁（退出/注销）→ 下面那句 after 自己会抛 TclError 被吞掉，
+            #    循环自然终止，不需要靠这里提前退出。
+            # 上一版对 TclError 直接 return，恰好漏掉了 docstring 里列为
+            # 「加这个保护的主要动机」的那个场景。
+            self._note_tick_failure(e)
         except Exception as e:
-            log(f"tick 异常：{e!r}")
+            self._note_tick_failure(e)
+        else:
+            self._note_tick_ok()
         if self._alive:
             try:
                 self.root.after(int(self.cfg["poll_seconds"] * 1000), self.tick)
             except tk.TclError:
                 pass
+
+    def _note_tick_failure(self, err):
+        """记一次 tick 失败。
+
+        只在状态变化时写日志：每 tick 都记的话，read_power 持续失败会一天
+        刷 1.7 万行（虽然 1MB 轮转兜得住，但真出事时日志反而没法看）。
+        """
+        self._tick_fails += 1
+        if self._tick_fails == 1:
+            log(f"tick 首次失败：{err!r}")
+        elif self._tick_fails == TICK_FAIL_WARN:
+            log(f"tick 已连续失败 {self._tick_fails} 次，浮条改显示「电量读取失败」")
+
+    def _note_tick_ok(self):
+        if self._tick_fails:
+            log(f"tick 恢复正常（此前连续失败 {self._tick_fails} 次）")
+            self._tick_fails = 0
 
     def _tick_once(self):
         if self.demo_pct is not None:
@@ -1596,6 +1663,10 @@ class App:
         self._last_tick = now
         self.rate.add(now, p["pct"], p["ac"])
         self.ledger.tick(p["pct"], p["ac"])
+        # demo 守卫：假电量算出来的离电时长会污染真实统计。
+        # 现在它「只是不落盘」，所以去掉守卫也只脏内存、不脏磁盘——但这是个地雷：
+        # 一旦哪天 demo 开始写盘，就会重演第二轮那个「demo 覆盖真实 stats」的 bug。
+        # 有测试专门钉这一条（selftest_ui 的 run_demo_no_persist）。
         if not self.demo and not p["ac"] and p["pct"] is not None:
             record_on_battery(self.stats, dt)
 
@@ -2561,8 +2632,62 @@ def self_test():
         cmd_exe = _autostart_command()
         assert cmd_exe == f'"{sys.executable}"', \
             f"exe 分支必须给 exe 路径加引号：{cmd_exe}"
+        # 显式喂一个带空格的路径，钉住「引号真的包住了整条路径」这件事
+        assert _autostart_command(r"C:\Program Files\BG\battery.exe") == \
+            r'"C:\Program Files\BG\battery.exe"', "带空格的 exe 路径必须整体加引号"
     finally:
         globals()["FROZEN"] = _saved_frozen
+
+    # py.exe 解析失败必须返回 None（调用方退回 py.exe，最坏只是闪黑框）。
+    # 绝不能返回不存在的路径——那会让开机自启直接失效，而且用户看不出来。
+    #
+    # 用假 subprocess 而不是真跑：自检不该依赖「本机有没有 py.exe」，
+    # 更不该在 PyInstaller 窗口模式下启动子进程（frozen 环境里没有控制台）。
+    class _NoSub:
+        DEVNULL = -3
+
+        @staticmethod
+        def run(*a, **k):
+            raise FileNotFoundError("injected: 模拟 py.exe 不存在")
+
+    _saved_sub = globals()["subprocess"]
+    globals()["subprocess"] = _NoSub()
+    try:
+        assert _resolve_py_launcher(r"C:\definitely\not\exists\py.exe") is None
+    finally:
+        globals()["subprocess"] = _saved_sub
+
+    # `py -0p` 的解析：只认带 * 的默认版本，没 * 就不猜
+    _pyout = (" -V:3.14 *        C:\\Python314\\python.exe\n"
+              " -V:3.13          C:\\Python313\\python.exe\n")
+    assert _parse_py_launcher_output(_pyout) == "C:\\Python314\\python.exe", \
+        _parse_py_launcher_output(_pyout)
+    assert _parse_py_launcher_output(
+        " -V:3.14          C:\\Python314\\python.exe\n") is None, \
+        "没有默认标记时不该猜"
+    assert _parse_py_launcher_output("") is None
+    assert _parse_py_launcher_output("nothing here") is None
+
+    # py.exe 分支必须真的被接上。只测 _resolve_py_launcher 函数本身不够：
+    # 把 `if os.path.basename(exe).lower() == "py.exe":` 改成 `if False:`
+    # 测试照样全绿，而实际效果是自启命令退化成 py.exe（登录闪黑框）。
+    #
+    # 两处必须显式处理，否则这段在 exe 里会直接失败：
+    #  - FROZEN 在 exe 里是 True，`_autostart_command` 会提前 return，走不到 py 分支；
+    #  - 不去动 sys.executable —— 那个值在 onefile 模式下是 PyInstaller 运行时
+    #    自己用的，改它会让 exe 的自检卡死（实测过，进程不退、无输出）。
+    # 所以：FROZEN 临时置假 + exe 参数注入。
+    _saved_frozen2 = globals()["FROZEN"]
+    _saved_resolve = globals()["_resolve_py_launcher"]
+    globals()["FROZEN"] = False
+    globals()["_resolve_py_launcher"] = lambda exe=None: "C:\\fake\\real\\python.exe"
+    try:
+        _cmd_py = _autostart_command("C:\\Windows\\py.exe")
+        assert "real" in _cmd_py, \
+            f"exe 是 py.exe 时必须用解析出的真实解释器：{_cmd_py}"
+    finally:
+        globals()["_resolve_py_launcher"] = _saved_resolve
+        globals()["FROZEN"] = _saved_frozen2
 
     # py.exe 解析失败必须返回 None（调用方退回 py.exe，最坏只是闪黑框）。
     # 绝不能返回不存在的路径——那会让开机自启直接失效，而且用户看不出来。
@@ -2705,6 +2830,31 @@ def self_test():
         '<a><FullChargeCapacity unit="mWh">50000</FullChargeCapacity></a>') - 50.0) < 0.15, \
         "带属性的标签必须能解析"
 
+    # <Battery> 段本身带属性时也要能分段。两处正则写法不一致是隐患：
+    # 容量标签支持属性、分段标签不支持，遇到 `<Battery id="BAT1">` 会退化成
+    # 只取第一块（两块 40Wh 读成 40Wh，回到修之前的 bug）。
+    _two_attr = ("<BatteryReport>"
+                 '<Battery id="BAT1"><FullChargeCapacity>40000</FullChargeCapacity></Battery>'
+                 '<Battery id="BAT2"><FullChargeCapacity>40000</FullChargeCapacity></Battery>'
+                 "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_two_attr) - 80.0) < 0.15, \
+        f"带属性的 Battery 段也要累加，实际 {_capacity_from_report_xml(_two_attr)}"
+
+    # 三块 100 Wh = 300 Wh：旧的 300 上限卡在边界上，正好会被丢掉
+    _three = ("<BatteryReport>"
+              + "<Battery><FullChargeCapacity>100000</FullChargeCapacity></Battery>" * 3
+              + "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_three) - 300.0) < 0.15, \
+        f"三块 100Wh 应读出 300Wh，实际 {_capacity_from_report_xml(_three)}"
+
+    # 单块离谱值只丢那一块，不该把整台机器的容量算飞、也不该连累其它块
+    _mixed = ("<BatteryReport>"
+              "<Battery><FullChargeCapacity>40000</FullChargeCapacity></Battery>"
+              "<Battery><FullChargeCapacity>999999999</FullChargeCapacity></Battery>"
+              "</BatteryReport>")
+    assert abs(_capacity_from_report_xml(_mixed) - 40.0) < 0.15, \
+        f"离谱分段应被丢弃，实际 {_capacity_from_report_xml(_mixed)}"
+
     # 离电时长与周对比
     _d = date(2026, 10, 31)
     st = {}
@@ -2745,6 +2895,11 @@ def self_test():
     assert should_autofill_capacity({"capacity_wh": 60.0}) is True
     assert should_autofill_capacity({"capacity_wh": 84.1}) is False, \
         "用户手填的容量不能被自动读取覆盖"
+    # 容差必须是「等于 60」，不是「接近 60」。真有 60.5 Wh 的电池时，
+    # 放宽到 1.0 会把用户填的值当成默认值覆盖掉。
+    assert should_autofill_capacity({"capacity_wh": 60.5}) is False, \
+        "60.5 是用户填的值，不是默认值"
+    assert should_autofill_capacity({"capacity_wh": 59.5}) is False
     assert should_autofill_capacity({"capacity_wh": 60.0}, demo=True) is False, \
         "演示模式不该起线程读硬件"
     assert should_autofill_capacity({}) is False, "缺键时不该当成默认值去读"

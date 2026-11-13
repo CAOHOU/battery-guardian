@@ -405,6 +405,48 @@ def run_tick_resilience(root):
         app.cfg["poll_seconds"] = saved_poll
 
     teardown(app)
+    pump(root, 0.3)
+
+    # TclError 必须单独用一个 app：上面那个 app 还排着 after，
+    # 复用会让「上一轮排的 after」冒充「TclError 分支重排了」，
+    # 结果就是「把 TclError 改回 return」测试照样绿。
+    app2 = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("TclError 后循环仍继续")
+
+    tcl = {"n": 0}
+    real2 = app2._tick_once
+
+    def boom_tcl():
+        tcl["n"] += 1
+        if tcl["n"] == 1:
+            raise tk.TclError("injected transient")
+        return real2()
+
+    saved_poll2 = app2.cfg["poll_seconds"]
+    app2.cfg["poll_seconds"] = 0.2
+    app2._tick_once = boom_tcl
+    try:
+        app2.tick()
+        pump(root, 0.8)
+        check("瞬时 TclError 后 tick 仍被再次调用", tcl["n"] >= 2, f"calls={tcl['n']}")
+    finally:
+        app2._tick_once = real2
+        app2.cfg["poll_seconds"] = saved_poll2
+
+    # 连续失败够久，浮条必须承认「读不到」，而不是继续显示陈旧电量。
+    # 一个还在动但已经瞎了的工具，比直接死掉更难被发现。
+    app2._tick_fails = 0
+    for _ in range(bg.TICK_FAIL_WARN - 1):
+        app2._note_tick_failure(RuntimeError("x"))
+    check("未到阈值仍显示正常文案", app2.sub_text() != "电量读取失败", app2.sub_text())
+    app2._note_tick_failure(RuntimeError("x"))
+    check("连续失败到阈值后改口", app2.sub_text() == "电量读取失败", app2.sub_text())
+    app2._note_tick_ok()
+    check("恢复后清空计数并回到正常文案",
+          app2._tick_fails == 0 and app2.sub_text() != "电量读取失败", app2.sub_text())
+
+    teardown(app2)
     pump(root, 0.2)
 
 
@@ -427,9 +469,15 @@ def run_demo_no_persist():
     pump(r, 0.3)
 
     stage("演示模式不落盘")
+    # 离电时长也不能被假电量累加。现在它「只是不落盘」，所以去掉守卫只脏内存；
+    # 但一旦哪天 demo 开始写盘，就会重演「假数据覆盖真统计」那个 bug。
+    before_days = dict(app.stats.get("days") or {})
     app.tick()
     pump(r, 0.2)
     check("tick 后没写 stats.json", not os.path.exists(bg.STATS_PATH))
+    check("demo 不累加离电时长",
+          (app.stats.get("days") or {}) == before_days,
+          f"{(app.stats.get('days') or {})}")
 
     # 第三条写盘路径：拖动/单击浮条会走 _save_cfg()，它原来没有 demo 守卫
     app._save_cfg()

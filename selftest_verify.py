@@ -52,6 +52,17 @@ def main():
     env = dict(os.environ)
     env["LOCALAPPDATA"] = fake
 
+    # 反向断言：真实 data/ 的 mtime 也不能变。
+    # 只验证「假 app_home 没被删」是不够的——如果将来有人把路径改成读真实
+    # LOCALAPPDATA（比如用 expanduser("~") 拼而不是读环境变量），假目录当然还在，
+    # 但用户真实数据已经被动了，而上面那三项照样 PASS。
+    real_data = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                             "BatteryGuardian", "data")
+    real_before = None
+    if os.path.isdir(real_data):
+        real_before = (os.stat(real_data).st_mtime_ns,
+                       sorted(os.listdir(real_data)))
+
     try:
         p = subprocess.run([sys.executable, VERIFY], env=env,
                            capture_output=True, text=True, timeout=120)
@@ -82,6 +93,20 @@ def main():
         print(("  PASS" if alive_dir else "  FAIL") +
               f" data 目录 {'仍在' if alive_dir else '被删了'}")
         ok = ok and alive_dir
+
+        # 真实目录必须原封不动
+        if real_before is None:
+            print("  SKIP 真实 data/ 不存在，跳过 mtime 反向断言")
+        else:
+            real_after = (os.stat(real_data).st_mtime_ns,
+                          sorted(os.listdir(real_data)))
+            same = real_after == real_before
+            print(("  PASS" if same else "  FAIL") +
+                  f" 真实 data/ 未被触碰（mtime + 文件列表）")
+            if not same:
+                print(f"  | 运行前 {real_before}")
+                print(f"  | 运行后 {real_after}")
+            ok = ok and same
     finally:
         shutil.rmtree(fake, ignore_errors=True)
 
