@@ -565,7 +565,27 @@ def _sanitize_config(cfg):
 
 def load_stats():
     st = _load_json(STATS_PATH, default_stats())
-    if (st.get("today") or {}).get("date") != str(date.today()):
+    if not isinstance(st, dict):
+        st = default_stats()
+
+    # 结构校验。stats.json 可能被手工改坏、被旧版本写坏、被外部工具动过。
+    # 不校验的话：days 变成字符串后，tick 每 5 秒抛一次 AttributeError，
+    # 30 秒后浮条显示「电量读取失败」——把**数据问题报成硬件问题**，
+    # 而且因为文件不会自己修好，它会永远显示下去。
+    d = default_stats()
+    if not isinstance(st.get("days"), dict):
+        st["days"] = {}
+    for k in ("streak_days", "incidents"):
+        v = st.get(k)
+        if not isinstance(v, int) or isinstance(v, bool):
+            st[k] = d[k]
+    for k in ("kwh", "wear"):
+        v = st.get(k)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            st[k] = d[k]
+    if not isinstance(st.get("today"), dict):
+        st["today"] = dict(d["today"])
+    if st["today"].get("date") != str(date.today()):
         st["today"] = {"date": str(date.today()), "kwh": 0.0, "wear": 0.0}
     return st
 
@@ -3232,6 +3252,17 @@ def self_test():
     assert App.chip_text(nb_chip) != "", \
         "缺 has_battery 时不应丢掉连续天数"
 
+    # stats.json 被改坏时，必须修好结构，而不是让 tick 每 5 秒抛异常、
+    # 30 秒后把「数据问题」报成「电量读取失败」（而且永不恢复）。
+    _save_json(STATS_PATH, {"days": "not a dict", "streak_days": "x",
+                            "kwh": None, "today": "nope", "incidents": []})
+    st_bad = load_stats()
+    assert isinstance(st_bad["days"], dict), st_bad["days"]
+    assert isinstance(st_bad["streak_days"], int), st_bad["streak_days"]
+    assert isinstance(st_bad["kwh"], (int, float)), st_bad["kwh"]
+    assert isinstance(st_bad["incidents"], int), st_bad["incidents"]
+    assert isinstance(st_bad["today"], dict) and "date" in st_bad["today"], \
+        st_bad["today"]
     print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、"
           "阈值顺序、静音不关保底层、连续天数、明早时长、账本、"
           "电池容量解析、离电时长周对比、日志轮转全部通过")
@@ -3336,6 +3367,11 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
+    # Tk 回调里的异常默认只打到 stderr，而 --windowed 的 exe 没有控制台，
+    # 等于线上问题一个落点都没有。接到 log 里，至少 app.log 能查到。
+    def _on_tk_error(exc, val, tb):
+        log(f"UI 回调异常：{val!r}")
+    root.report_callback_exception = _on_tk_error
     # 启动标记放 App 之前：万一 App 初始化就崩了，也能看出「启动了但没起来」
     log(f"程序启动 v{__version__} pid={os.getpid()}")
     app = App(root, load_config(), load_stats(), demo_pct=demo_pct)

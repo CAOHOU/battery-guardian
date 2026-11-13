@@ -387,6 +387,31 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_esc_escape(root):
+    """长按 Esc 的逃生口必须真的静音。
+
+    这条原来零覆盖：把 `_esc_fire` 里的 `mute(30)` 改成 `pass`，
+    `--self-test` 和 `selftest_ui` 都会绿（审查的独立变异 A10 证实）。
+
+    它和 `mute()` 一样是「安全相关的调用点」——`自检规程 §4.3` 要求
+    函数和调用点都测。测了函数没测调用点，等于没测。
+    """
+    app = make_app(root, 15, "right")
+    pump(root, 0.5)
+    stage("Esc 逃生口")
+    check("前置：确认框已弹出", app.dialog is not None)
+
+    app._esc_fire()
+    pump(root, 0.2)
+    left = app.muted_until - time.time()
+    check("Esc 长按把静音推到未来（约 30 分钟）",
+          left > 29 * 60, f"剩余 {left:.0f}s")
+    check("Esc 长按顺手关掉确认框", app.dialog is None)
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_visual_glyphs(root):
     """三个视觉改动的自动化断言：直接检查 canvas 图元。
 
@@ -934,6 +959,7 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_esc_escape(root)
     run_visual_glyphs(root)
     run_measured_prefix(root)
     run_claim_logging(root)
