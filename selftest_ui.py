@@ -371,6 +371,106 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_visual_glyphs(root):
+    """三个视觉改动的自动化断言：直接检查 canvas 图元。
+
+    审查用 PIL 截图人工验证过（结论：画对了），但那是人工的，进不了 CI。
+    这组断言能抓住「闪电不画」「书签不画」「边框不变色」这类改动——
+    之前这些全是盲区，改坏了测试照样全绿。
+
+    用尺寸区分图元：背景圆角框是整条浮条（几百 px），
+    闪电只有 7×11 px，书签只有 3×12 px。
+    """
+    app = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("视觉图元")
+
+    def bg_polygon():
+        """取面积最大的 polygon —— 那是浮条背景。"""
+        best, best_area = None, -1
+        for i in app.canvas.find_all():
+            if app.canvas.type(i) != "polygon":
+                continue
+            c = app.canvas.coords(i)
+            xs, ys = c[0::2], c[1::2]
+            area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+            if area > best_area:
+                best, best_area = i, area
+        return best
+
+    def small_polygons(max_w, max_h):
+        """宽高都不超过阈值的 polygon（闪电）。"""
+        out = []
+        for i in app.canvas.find_all():
+            if app.canvas.type(i) != "polygon":
+                continue
+            c = app.canvas.coords(i)
+            xs, ys = c[0::2], c[1::2]
+            if (max(xs) - min(xs)) <= app.px(max_w) and (max(ys) - min(ys)) <= app.px(max_h):
+                out.append(i)
+        return out
+
+    def set_power(ac):
+        app.power = {"ac": ac, "pct": 80, "secs": 3600 if ac else None,
+                     "charging": ac, "has_battery": True}
+        app.render_hud()
+        pump(root, 0.15)
+
+    # --- 充电态：电池内部必须有闪电 ---
+    set_power(True)
+    bolts = small_polygons(12, 14)
+    check("充电时画了闪电", len(bolts) == 1, f"{len(bolts)} 个")
+
+    if bolts:
+        coords = app.canvas.coords(bolts[0])
+        xs = coords[0::2]
+        left = app.px(15)                      # 电池起始 x
+        right = left + app.px(24)              # 电池宽 24
+        check("闪电画在电池内部",
+              left <= min(xs) and max(xs) <= right,
+              f"闪电 x=[{min(xs):.0f},{max(xs):.0f}] 电池=[{left},{right}]")
+        # 7 个顶点必须互不相同（100% DPI 下曾经塌缩成 6 个）
+        pts = list(zip(coords[0::2], coords[1::2]))
+        check("闪电 7 个顶点互不重合", len(set(pts)) == 7,
+              f"{len(set(pts))} 个不同顶点")
+
+    # --- 未充电：不画闪电 ---
+    set_power(False)
+    check("未充电时不画闪电", len(small_polygons(12, 14)) == 0)
+
+    # --- 固定态：边框换色加粗 + 左侧书签 ---
+    app.pinned = False
+    app.render_hud()
+    pump(root, 0.1)
+    b0 = bg_polygon()
+    out0 = app.canvas.itemcget(b0, "outline")
+    w0 = str(app.canvas.itemcget(b0, "width"))
+
+    app.pinned = True
+    app.render_hud()
+    pump(root, 0.1)
+    b1 = bg_polygon()
+    out1 = app.canvas.itemcget(b1, "outline")
+    w1 = str(app.canvas.itemcget(b1, "width"))
+
+    check("固定时边框换色", out0 != out1, f"{out0} -> {out1}")
+    check("固定时边框加粗到 2", float(w1) == 2.0, f"未固定 {w0} -> 固定 {w1}")
+
+    # 书签：x 起点 ≤ 2px、宽度 ≤ 4px 的矩形
+    bookmarks = []
+    for i in app.canvas.find_all():
+        if app.canvas.type(i) != "rectangle":
+            continue
+        c = app.canvas.coords(i)
+        if c[0] <= app.px(2) and (c[2] - c[0]) <= app.px(4):
+            bookmarks.append(i)
+    check("固定时画了书签方块", len(bookmarks) >= 1, f"{len(bookmarks)} 个")
+
+    app.pinned = False
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_measured_prefix(root):
     """实测兜底时必须标「实测」——否则用户以为它和系统值一样准。
 
@@ -818,6 +918,7 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_visual_glyphs(root)
     run_measured_prefix(root)
     run_claim_logging(root)
     run_tick_resilience(root)

@@ -1394,7 +1394,15 @@ class App:
         **可点但没反应，比置灰更让人困惑**：用户会以为点错了，再点一次。
         实测三天里有一次 37 秒内点了 11 次静音，就是这么来的。
         """
-        if self.failsafe_win is not None:
+        # 三种状态都算「保底层正在或刚刚生效」：
+        #  - 倒计时窗口开着
+        #  - 休眠失败提示窗开着（此时保底层不会再重开，静音也无事可做）
+        #  - 已经因休眠失败停止重试
+        # 不能写成 `or level == "fail_safe"`：用户关掉 enable_fail_safe 时
+        # 8% 的 level 仍是 fail_safe，但那时静音本该可用。
+        if (self.failsafe_win is not None
+                or self.fail_win is not None
+                or self._hibernate_failed):
             return "disabled"
         return "normal"
 
@@ -1456,6 +1464,27 @@ class App:
         self.canvas.create_rectangle(x + w + self.px(1.5), cy - self.px(3),
                                      x + w + self.px(3.5), cy + self.px(3),
                                      outline=color, fill=color, width=0)
+        if ac:
+            # 充电时电池内部只画闪电，**不画电量条**：
+            # 两个同色图元叠在一起会糊成一团，而百分比数字已经说明了电量。
+            # 闪电画在电池内部居中，不额外占浮条宽度（原来画在电池右侧要加宽 10px）。
+            #
+            # 顶点用整数比例，避免 S=1 时 int(round()) 把相邻点塌缩成同一个
+            # （原来 4.5/4 在 100% DPI 下都变成 4，闪电腰部就断了）。
+            bx = x + self.px(8.5)
+            by = cy - self.px(5.5)
+            px = self.px
+            pts = [
+                int(bx + px(4)), int(by),
+                int(bx + px(7)), int(by),
+                int(bx + px(5)), int(by + px(5)),
+                int(bx + px(8)), int(by + px(5)),
+                int(bx + px(3)), int(by + px(11)),
+                int(bx + px(4)), int(by + px(5)),
+                int(bx + px(1)), int(by + px(5)),
+            ]
+            self.canvas.create_polygon(pts, fill=color, outline="", width=0)
+            return
         if pct is not None and pct > 0:
             pad = self.px(2.5)
             inner = int((w - 2 * pad) * min(100, pct) / 100.0)
@@ -1463,24 +1492,6 @@ class App:
                 self.canvas.create_rectangle(
                     x + pad, y1 + pad, x + pad + inner, y2 - pad,
                     outline=color, fill=color, width=0)
-        if ac:
-            # 充电标志：电池右侧画一个闪电。
-            # 原来是一条从电池左下角拉到右上角的斜线——那正好是「禁止」符号的
-            # 画法，看起来像「电池被划掉」，而不是「正在充电」。
-            # 位置在电池帽右侧，布局里 gw 也为它多留了 10px（见 render_hud）。
-            bx = x + w + self.px(5)
-            by = cy - self.px(6)
-            px = self.px
-            pts = [
-                int(bx + px(3)), int(by),
-                int(bx + px(7)), int(by),
-                int(bx + px(4.5)), int(by + px(6)),
-                int(bx + px(8)), int(by + px(6)),
-                int(bx + px(2.5)), int(by + px(12)),
-                int(bx + px(4)), int(by + px(6)),
-                int(bx + px(0.5)), int(by + px(6)),
-            ]
-            self.canvas.create_polygon(pts, fill=color, outline="", width=0)
 
     def _render_collapsed(self):
         cv = self.canvas
@@ -1524,9 +1535,9 @@ class App:
 
         pad_x = self.px(15)
         gap = self.px(8)
-        # 充电时右边多一个闪电，宽度要留出来，否则会压到百分比文字上
+        # 闪电现在画在电池内部，不再需要额外宽度
         show_bolt = self.power["ac"] and self.power.get("has_battery", True)
-        gw = self.px(26) + (self.px(10) if show_bolt else 0)
+        gw = self.px(26)
 
         x = pad_x
         glyph_x = x
@@ -1686,9 +1697,13 @@ class App:
         if hi - lo >= 12:
             lo_h, lo_m = hm(lo)
             hi_h, hi_m = hm(hi)
-            if lo_h == hi_h:
-                return f"约 {lo_h} 小时 {lo_m}–{hi_m} 分钟"
-            return f"约 {lo_h} 小时 {lo_m} 分 – {hi_h} 小时 {hi_m} 分"
+            if lo_h == 0:
+                # 不到一小时就退回分钟区间，别写「0 小时 50 分」
+                return f"约 {int(round(lo))}–{int(round(hi))} 分钟"
+            # 分钟为 0 时省略「0 分」，避免「1 小时 0 分 – 10 小时 0 分」
+            lo_s = f"{lo_h} 小时" + (f" {lo_m} 分" if lo_m else "")
+            hi_s = f"{hi_h} 小时" + (f" {hi_m} 分" if hi_m else "")
+            return f"约 {lo_s} – {hi_s}"
 
         h, m = hm((lo + hi) / 2)
         if m == 0:
@@ -2508,18 +2523,46 @@ def self_test():
     _, _, src2 = App.estimate(_EstStub2())
     assert src2 == "measured", f"系统值不可用时应退回实测，实际 {src2}"
 
+    # 区间格式的边界：不能出现「0 小时」「0 分」
+    assert App.fmt_duration(None, 50, 130) == "约 50–130 分钟", \
+        App.fmt_duration(None, 50, 130)
+    assert App.fmt_duration(None, 60, 600) == "约 1 小时 – 10 小时", \
+        App.fmt_duration(None, 60, 600)
+    assert App.fmt_duration(None, 61, 73) == "约 1 小时 1 分 – 1 小时 13 分", \
+        App.fmt_duration(None, 61, 73)
+
     # 保底层生效期间，「安静 N 分钟」必须置灰——静音对倒计时无效，
     # 可点但没反应比置灰更让人困惑（实测有 37 秒点 11 次的情况）。
     class _MuteStub:
         failsafe_win = None
+        fail_win = None
+        _hibernate_failed = False
 
     assert App._mute_menu_state(_MuteStub()) == "normal"
 
     class _MuteStub2:
         failsafe_win = object()
+        fail_win = None
+        _hibernate_failed = False
 
     assert App._mute_menu_state(_MuteStub2()) == "disabled", \
-        "保底层生效期间静音菜单必须置灰"
+        "倒计时窗口开着时必须置灰"
+
+    class _MuteStub3:
+        failsafe_win = None
+        fail_win = object()
+        _hibernate_failed = False
+
+    assert App._mute_menu_state(_MuteStub3()) == "disabled", \
+        "休眠失败提示窗开着时也必须置灰（静音同样无事可做）"
+
+    class _MuteStub4:
+        failsafe_win = None
+        fail_win = None
+        _hibernate_failed = True
+
+    assert App._mute_menu_state(_MuteStub4()) == "disabled", \
+        "休眠失败已停止重试时也必须置灰"
 
     # 台式机回归：从原始字节解析，255（未知）必须读成 255，不能是 -1。
     # 注意要用 from_buffer_copy 而不是给字段赋值——赋值测的是写入，测不出符号
