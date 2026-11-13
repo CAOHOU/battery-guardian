@@ -26,6 +26,7 @@ import time
 import subprocess
 import tempfile
 import tkinter as tk
+import types
 import tkinter.font as tkfont
 from collections import deque
 from datetime import date, datetime, timedelta
@@ -420,10 +421,15 @@ def _sanitize_config(cfg):
         ordered = {}
         prev = 100
         for k in ("hint", "nudge", "dialog", "cost", "fail_safe"):
-            v = int(_as_num(th.get(k), DEFAULTS["thresholds"][k], 0, 100))
-            v = min(v, prev)
-            ordered[k] = v
-            prev = v
+            raw = th.get(k)
+            v = int(_as_num(raw, DEFAULTS["thresholds"][k], 0, 100))
+            clamped = min(v, prev)
+            # 静默改写用户配置是最气人的那种 bug：他改了，以为生效了，其实没有
+            if clamped != v and os.path.isdir(DATA_DIR):
+                log(f"阈值 {k} 从 {v} 压到 {clamped}"
+                    f"（必须满足 hint>=nudge>=dialog>=cost>=fail_safe）")
+            ordered[k] = clamped
+            prev = clamped
         cfg["thresholds"] = ordered
         return cfg
     except Exception:
@@ -683,10 +689,15 @@ class App:
         self.ledger_win = None
         self.about_win = None
         self.banner = None
+        self.fail_win = None
         self.pulse_on = False
         self._esc_timer = None
         self._save_timer = 0.0
         self._incident_flag = False
+        # 休眠失败后不再重开倒计时。没有这个标记的话，失败 → 窗口关闭 →
+        # 下一个 tick 又满足 failsafe_win is None → 重开 → 再响一声，
+        # 变成「每 65 秒响一次、关不掉」的无限循环。
+        self._hibernate_failed = False
 
         # 吸附 / 收起状态
         self.dock_edge = cfg.get("dock_edge", "right")
@@ -836,6 +847,10 @@ class App:
         self._save_cfg()
 
     def _save_cfg(self):
+        # demo 也不能写真实 config：拖一下浮条就把用户真实的窗口位置改掉了。
+        # 这是第三条写盘路径——tick 和 quit 守住了，这条原来漏了。
+        if self.demo:
+            return
         self.cfg["dock_edge"] = self.dock_edge
         self.cfg["pinned"] = self.pinned
         self.cfg["hud_pos"] = [self.free_x if self.free_x is not None else self.hud_x,
@@ -998,17 +1013,28 @@ class App:
     def _mute_until_morning(self):
         self.mute(minutes_until_morning())
 
+    def _morning_menu_state(self):
+        """「安静到明早」在低电量时应置灰。
+
+        那个组合基本等于亲手安排一次硬关机，值得挡一下。
+        抽成纯判定是为了能测——原来埋在 _popup_menu 里，弹出菜单要真的
+        tk_popup，自动化里没法稳定触发，等于零覆盖。
+        """
+        pct = self.power.get("pct")
+        low = (pct is not None and not self.power.get("ac")
+               and pct <= int(self.cfg["thresholds"]["nudge"]))
+        if low:
+            return "disabled", "安静到明早（电量已低，不建议）"
+        return "normal", "安静到明早"
+
     def _popup_menu(self, e):
-        # 低电量时把「安静到明早」置灰：电量已经低于 nudge 线还要静音到明早，
-        # 基本等于亲手安排一次硬关机，值得挡一下。
+        # 低电量时把「安静到明早」置灰
         try:
-            pct = self.power.get("pct")
-            low = (pct is not None and not self.power.get("ac")
-                   and pct <= int(self.cfg["thresholds"]["nudge"]))
+            state, label = self._morning_menu_state()
             self.menu.entryconfigure(
                 self._menu_morning_idx,
-                state=tk.DISABLED if low else tk.NORMAL,
-                label="安静到明早（电量已低，不建议）" if low else "安静到明早")
+                state=tk.DISABLED if state == "disabled" else tk.NORMAL,
+                label=label)
         except Exception:
             pass
         try:
@@ -1279,7 +1305,9 @@ class App:
                     self.stats["streak_days"] = 0
                     _save_json(STATS_PATH, self.stats)
                     log(f"记录一次断电事件，累计 {self.stats['incidents']} 次")
-            if self.cfg.get("enable_fail_safe") and not self.demo:
+            # 休眠失败过就别再重开倒计时：重开只会变成无限响铃
+            if (self.cfg.get("enable_fail_safe") and not self.demo
+                    and not self._hibernate_failed):
                 if self.failsafe_win is None:
                     self._open_failsafe()
             return
@@ -1533,7 +1561,60 @@ class App:
             return
         log("触发保底层：自动休眠")
         self._close_failsafe()
-        hibernate()
+        ok = hibernate()
+        if ok:
+            return
+        # 休眠失败（系统禁用了休眠 / 权限不足）时，原来什么都不做，
+        # 于是下一个 tick 又满足 failsafe_win is None → 重开倒计时 → 再响一声，
+        # 变成每约 65 秒响一次、且三条出口全堵死的无限循环。
+        self._hibernate_failed = True
+        log("休眠失败，停止重试（系统可能禁用了休眠）")
+        self._show_hibernate_failed()
+
+    def _show_hibernate_failed(self):
+        """休眠失败后的提示窗：不响、不重试、允许关闭。
+
+        这一屏是给用户自己动手的——工具已经无能为力，至少别让它变成噪音源。
+        """
+        if self.fail_win is not None:
+            return
+        win = tk.Toplevel(self.root)
+        self.fail_win = win
+        win.title("自动休眠失败")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.configure(bg=C["red_bg"])
+        self._set_icon(win)
+        win.protocol("WM_DELETE_WINDOW", self._close_fail_win)
+
+        wrap = tk.Frame(win, bg=C["red_bg"])
+        pad_x, pad_y = self.px(24), self.px(20)
+        wrap.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
+
+        tk.Label(wrap, text="自动休眠失败", bg=C["red_bg"], fg=C["red"],
+                 font=self.f_title, anchor="w").pack(fill="x")
+        tk.Label(wrap,
+                 text="系统没有接受休眠请求（可能禁用了休眠）。\n"
+                      "不会再重试，也不会再响。请自己保存工作并插电。",
+                 bg=C["red_bg"], fg="#7A4A4A", font=self.f_txt,
+                 anchor="w", justify="left",
+                 wraplength=self.px(340)).pack(fill="x", pady=(self.px(8), self.px(14)))
+
+        btn = tk.Label(wrap, text="知道了", bg=C["surface_soft"], fg=C["text"],
+                       font=self.f_txt, bd=0, padx=self.px(12), pady=self.px(9),
+                       cursor="hand2")
+        btn.pack(fill="x")
+        btn.bind("<Button-1>", lambda e: self._close_fail_win())
+
+        self._fit(win, wrap, pad_x, pad_y, self.px(340))
+
+    def _close_fail_win(self):
+        if self.fail_win is not None:
+            try:
+                self.fail_win.destroy()
+            except tk.TclError:
+                pass
+        self.fail_win = None
 
     def _close_failsafe(self):
         if self.failsafe_win is not None:
@@ -1770,11 +1851,17 @@ def self_test():
 
     # P0-1 的行为面：静音期间到 5%，保底层仍然要起来
     class _EscStub:
-        """只保留 _handle_escalation 需要的字段，用来验证静音与保底层的优先级。"""
+        """只保留 _handle_escalation 需要的字段，用来验证静音与保底层的优先级。
+
+        属性要给全：顺序一旦被改坏，缺属性会以 AttributeError 崩掉，
+        而不是干净地断言失败——那等于测试本身也坏了。
+        """
         cfg = default_config()
         demo = False
         failsafe_win = None
+        dialog = None
         _incident_flag = True          # 跳过计数落盘
+        _hibernate_failed = False
         level = "fail_safe"
         power = {"ac": False, "pct": 5, "secs": None,
                  "charging": False, "has_battery": True}
@@ -1782,20 +1869,36 @@ def self_test():
         def __init__(self):
             self.muted_until = time.time() + 3600
             self.opened = 0
+            self.dialogs = 0
 
         def _open_failsafe(self):
             self.opened += 1
+
+        def _open_dialog(self):
+            self.dialogs += 1
 
     es = _EscStub()
     App._handle_escalation(es, time.time())
     assert es.opened == 1, "静音期间到 5% 必须仍然弹出保底层，实际没有弹"
 
+    # 休眠失败过之后不能再重开倒计时，否则就是无限响铃
+    es_failed = _EscStub()
+    es_failed._hibernate_failed = True
+    App._handle_escalation(es_failed, time.time())
+    assert es_failed.opened == 0, "休眠失败后不应重开保底层"
+
     # 反过来：静音期间 L3 确认框不该弹（静音本来就是为了别打扰）
     es2 = _EscStub()
     es2.level = "dialog"
-    es2.opened = 0
     App._handle_escalation(es2, time.time())
-    assert es2.opened == 0, "静音期间不该触发保底层"
+    assert es2.dialogs == 0, "静音期间不该弹确认框"
+
+    # 不静音时必须弹，证明上面那条不是因为别的原因没弹（否则是空断言）
+    es3 = _EscStub()
+    es3.level = "dialog"
+    es3.muted_until = 0
+    App._handle_escalation(es3, time.time())
+    assert es3.dialogs == 1, "未静音时应当弹确认框"
 
     for pct, expect in [(90, "calm"), (45, "hint"), (25, "nudge"),
                         (15, "dialog"), (5, "fail_safe")]:
@@ -2016,6 +2119,47 @@ def self_test():
     finally:
         globals()["play_alert"] = _orig_play
 
+    # 提示音的真实行为：音色别名 + 异步标志。改成同步会卡住 UI 循环，
+    # 但没有任何测试会红——用假的 winsound 模块把调用参数钉死。
+    _fake = types.ModuleType("winsound")
+    _fake.SND_ALIAS = 0x10000
+    _fake.SND_ASYNC = 0x1
+    _got = []
+    _fake.PlaySound = lambda name, flags: _got.append((name, flags))
+    _saved_ws = sys.modules.get("winsound")
+    sys.modules["winsound"] = _fake
+    try:
+        assert play_alert("dialog") is True
+        assert play_alert("failsafe") is True
+        assert _got[0] == ("SystemExclamation", 0x10001), _got[0]
+        assert _got[1] == ("SystemHand", 0x10001), _got[1]
+        assert _got[1][1] & _fake.SND_ASYNC, "必须异步播放，同步会卡住 UI"
+    finally:
+        if _saved_ws is None:
+            sys.modules.pop("winsound", None)
+        else:
+            sys.modules["winsound"] = _saved_ws
+
+    # --panel failsafe 必须强制演示模式，否则倒计时到 0 会真的休眠
+    p1 = type("P", (), {"demo": False})()
+    assert force_demo_for_panel(p1, "failsafe") is True
+    assert p1.demo is True, "failsafe 面板必须强制演示模式"
+    p2 = type("P", (), {"demo": False})()
+    assert force_demo_for_panel(p2, "ledger") is False
+    assert p2.demo is False, "其他面板不该改 demo"
+    p3 = type("P", (), {"demo": True})()
+    assert force_demo_for_panel(p3, "failsafe") is False, "已经是 demo 就不必再改"
+
+    # 右键「安静到明早」的置灰判定（弹出菜单本身没法在自动化里触发）
+    def _mm(pct, ac=False):
+        return type("M", (), {"power": {"ac": ac, "pct": pct}, "cfg": cfg})()
+
+    assert App._morning_menu_state(_mm(30))[0] == "disabled", "正好在 nudge 线上要置灰"
+    assert App._morning_menu_state(_mm(29))[0] == "disabled"
+    assert App._morning_menu_state(_mm(31))[0] == "normal"
+    assert App._morning_menu_state(_mm(5, ac=True))[0] == "normal", "插电时不该置灰"
+    assert App._morning_menu_state(_mm(None))[0] == "normal", "电量未知时不该置灰"
+
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {
         "kwh": 0.0, "wear": 0.0,
@@ -2049,6 +2193,19 @@ def self_test():
 
 
 # ---------------------------------------------------------------- 入口
+
+def force_demo_for_panel(app, panel):
+    """`--panel failsafe` 绕过电量判断直接开保底层，倒计时到 0 会真的调休眠。
+
+    没带 --demo 就等于「看一眼界面，机器睡过去」，所以强制演示模式。
+    抽成函数是为了能被测——原来这段埋在 main() 里，删掉它没有任何测试会红。
+    返回是否强制过。
+    """
+    if panel == "failsafe" and not app.demo:
+        app.demo = True
+        return True
+    return False
+
 
 def main():
     try:
@@ -2121,10 +2278,7 @@ def main():
     if panel == "ledger":
         root.after(300, app.open_ledger)
     elif panel == "failsafe":
-        # 这条路径绕过了电量判断，直接开保底层窗口；倒计时到 0 会真的调休眠。
-        # 没带 --demo 就等于「看一眼界面，机器睡过去」，所以强制演示模式。
-        if not app.demo:
-            app.demo = True
+        if force_demo_for_panel(app, panel):
             log("--panel failsafe 未带 --demo，已强制演示模式（不会真的休眠）")
             print("提示：--panel failsafe 未带 --demo，已强制演示模式，不会真的休眠。")
         root.after(300, app._open_failsafe)

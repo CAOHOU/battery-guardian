@@ -73,7 +73,7 @@ def make_app(root, pct, dock):
 def teardown(app):
     app._alive = False
     for w in (app.hud, app.dialog, app.failsafe_win, app.banner,
-              app.ledger_win, app.about_win):
+              app.ledger_win, app.about_win, app.fail_win):
         if w is not None:
             try:
                 w.destroy()
@@ -381,6 +381,10 @@ def run_demo_no_persist():
     pump(r, 0.2)
     check("tick 后没写 stats.json", not os.path.exists(bg.STATS_PATH))
 
+    # 第三条写盘路径：拖动/单击浮条会走 _save_cfg()，它原来没有 demo 守卫
+    app._save_cfg()
+    check("_save_cfg 不写 config.json", not os.path.exists(bg.CFG_PATH))
+
     app.quit()          # 会销毁自己的 root，之后不能再 pump
     check("退出后也没写 stats.json", not os.path.exists(bg.STATS_PATH))
     check("退出后也没写 config.json", not os.path.exists(bg.CFG_PATH))
@@ -415,6 +419,115 @@ def run_sound(root):
     pump(root, 0.3)
     check("总开关关掉后不响", SOUNDS == [], str(SOUNDS))
     app.cfg["sound_enabled"] = True
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_hibernate_failed(root):
+    """休眠失败不能变成无限响铃。
+
+    这是第二轮审查的 P1：hibernate() 返回 False 时原来什么都不做，
+    下一个 tick 又满足 failsafe_win is None → 重开倒计时 → 再响一声。
+    打桩 hibernate 返回 False，真机不会被休眠。
+    """
+    app = make_app(root, 5, "right")
+    pump(root, 0.4)
+    stage("休眠失败")
+
+    app.demo = False                     # 只有非 demo 才会真的去休眠
+    orig_hib = bg.hibernate
+    bg.hibernate = lambda: False
+    try:
+        del SOUNDS[:]
+        app._do_hibernate()
+        pump(root, 0.2)
+
+        check("标记为休眠失败", app._hibernate_failed is True)
+        check("弹出失败提示窗", app.fail_win is not None)
+        check("失败时不响铃", SOUNDS == [], str(SOUNDS))
+
+        # 再走一遍升级逻辑：不能重开保底层，否则就是每分钟响一次
+        del SOUNDS[:]
+        app.level = "fail_safe"
+        app.failsafe_win = None
+        app._handle_escalation(time.time())
+        pump(root, 0.2)
+        check("失败后不再重开保底层", app.failsafe_win is None)
+        check("失败后不再响保底层提示音", SOUNDS == [], str(SOUNDS))
+    finally:
+        bg.hibernate = orig_hib
+        app._close_fail_win()
+        app.demo = True
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_failsafe_sound(root):
+    """保底层提示音：demo 模式下开窗口，不会真休眠（休眠在倒计时结束时）。"""
+    app = make_app(root, 5, "right")
+    pump(root, 0.4)
+    stage("保底层提示音")
+
+    del SOUNDS[:]
+    app.cfg["fail_safe_countdown"] = 999      # 别让倒计时走到 0
+    app._open_failsafe()
+    pump(root, 0.2)
+    check("保底层弹出时响一次", SOUNDS.count("failsafe") == 1, str(SOUNDS))
+
+    app._close_failsafe()
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_dialog_reset(root):
+    """确认框关闭后 dialog_grow 必须归零，否则下次一弹就是放大的。"""
+    app = make_app(root, 15, "right")
+    pump(root, 0.4)
+    stage("确认框状态重置")
+
+    check("初始已弹框", app.dialog is not None)
+    app.dialog_grow = 2
+    app._close_dialog()
+    pump(root, 0.2)
+    check("关闭后 dialog_grow 归零", app.dialog_grow == 0, f"grow={app.dialog_grow}")
+
+    teardown(app)
+    pump(root, 0.2)
+
+
+def run_geometry_clamp(root):
+    """位置钳制与 min_w 保底：算出来的坐标不能是负数。"""
+    app = make_app(root, 80, "right")
+    pump(root, 0.4)
+    stage("位置钳制")
+
+    sw = app.hud.winfo_screenwidth()
+    app.dock_edge = "right"
+    app.collapsed = False
+    app.hud_w = sw + app.px(500)          # 比屏幕还宽 → 右贴边会算出负坐标
+    app._sync_geometry()
+    check("坐标不为负", app.hud_x >= 0, f"x={app.hud_x}")
+
+    app.hud_w = app.px(300)
+    app._sync_geometry()
+    check("正常宽度仍贴右边", app.hud_x + app.hud_w == sw,
+          f"x={app.hud_x} w={app.hud_w} sw={sw}")
+
+    # _fit 的 min_w 保底
+    win = tk.Toplevel(root)
+    wrap = tk.Frame(win, width=10, height=10)
+    wrap.pack()
+    win.update_idletasks()
+    got = {}
+    orig_center = app._center
+    app._center = lambda w, ww, hh: got.update(w=ww, h=hh)
+    app._fit(win, wrap, app.px(4), app.px(4), min_w=app.px(400))
+    app._center = orig_center
+    check("_fit 的 min_w 生效", got.get("w", 0) >= app.px(400),
+          f"got={got.get('w')} min={app.px(400)}")
+    win.destroy()
 
     teardown(app)
     pump(root, 0.2)
@@ -455,6 +568,10 @@ def main():
     run_slide_frames(root)
     run_force_expand(root)
     run_sound(root)
+    run_failsafe_sound(root)
+    run_dialog_reset(root)
+    run_geometry_clamp(root)
+    run_hibernate_failed(root)
     run_demo_no_persist()
 
     root.destroy()
