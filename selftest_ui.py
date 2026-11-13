@@ -546,6 +546,40 @@ def run_geometry_clamp(root):
     pump(root, 0.2)
 
 
+def _labels(widget):
+    """递归收集所有 Label 的文本，用来断言窗口里到底显示了什么。"""
+    out = []
+    for ch in widget.winfo_children():
+        try:
+            if ch.winfo_class() == "Label":
+                out.append(ch.cget("text"))
+        except tk.TclError:
+            pass
+        out.extend(_labels(ch))
+    return out
+
+
+def run_ledger(root):
+    """账本窗口要能显示「离电时长」的周对比——只算钱是不够的。"""
+    app = make_app(root, 80, "right")
+    pump(root, 0.3)
+    stage("账本窗口")
+
+    app.stats["days"] = {str(bg.date.today()): 7200}
+    app.open_ledger()
+    pump(root, 0.3)
+    texts = _labels(app.ledger_win)
+    check("账本显示本周离电", any("本周" in t for t in texts), str(texts[:8]))
+    check("账本显示上周离电", any("上周" in t for t in texts), str(texts[:8]))
+    check("账本显示 2.0 小时", any("2.0 小时" in t for t in texts), str(texts))
+
+    if app.ledger_win is not None:
+        app.ledger_win.destroy()
+        app.ledger_win = None
+    teardown(app)
+    pump(root, 0.2)
+
+
 def main():
     # 测试写到临时目录，绝不能碰用户真实的 config / stats
     tmp = tempfile.mkdtemp(prefix="bg-test-")
@@ -584,6 +618,7 @@ def main():
     run_failsafe_sound(root)
     run_dialog_reset(root)
     run_geometry_clamp(root)
+    run_ledger(root)
     run_hibernate_failed(root)
     run_demo_no_persist()
 

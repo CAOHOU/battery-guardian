@@ -27,6 +27,7 @@ import sys
 import time
 import subprocess
 import tempfile
+import threading
 import tkinter as tk
 import types
 import tkinter.font as tkfont
@@ -151,6 +152,70 @@ def _clean_secs(secs):
     if secs <= 0 or secs > 48 * 3600:
         return None
     return secs
+
+
+def _capacity_from_report_xml(xml_text):
+    """从 powercfg batteryreport 的 XML 里取电池容量（Wh）。
+
+    优先 FullChargeCapacity（当前实际满充），退回 DesignCapacity（出厂设计）。
+    账本算的是「这次放电实际放出多少电」，所以当前值更贴切。
+    抽成纯函数是为了能喂固定文本测，不用真跑 powercfg。
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    def pick(tag):
+        for el in root.iter():
+            if el.tag.split("}")[-1] != tag or not el.text:
+                continue
+            try:
+                v = float(el.text)
+            except ValueError:
+                continue
+            if v > 0:
+                return v
+        return None
+
+    mwh = pick("FullChargeCapacity") or pick("DesignCapacity")
+    if not mwh:
+        return None
+    wh = mwh / 1000.0
+    # 笔记本电池实际在 20-150 Wh 之间；超出这个量级说明解析到了别的数字
+    if not (5.0 <= wh <= 300.0):
+        return None
+    return round(wh, 1)
+
+
+def read_battery_capacity_wh(timeout=25):
+    """跑 powercfg 读本机电池容量，读不到返回 None。
+
+    用 -xml 而不是默认的 HTML：HTML 是给人看的，本地化之后字段名会变。
+    注意这台机器的 powercfg 只认连字符写法（-output / -xml），斜杠写法报「参数无效」。
+    """
+    fd, path = tempfile.mkstemp(suffix=".xml", prefix="bg-batt-")
+    os.close(fd)
+    try:
+        os.remove(path)          # powercfg 自己会创建，先删掉免得它拒绝覆盖
+    except OSError:
+        pass
+    try:
+        subprocess.run(["powercfg", "-batteryreport", "-output", path, "-xml"],
+                       capture_output=True, timeout=timeout)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return _capacity_from_report_xml(f.read())
+    except Exception:
+        return None
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def _ac_from_status(v):
@@ -332,6 +397,7 @@ def default_stats():
         "kwh": 0.0,
         "wear": 0.0,
         "today": {"date": str(date.today()), "kwh": 0.0, "wear": 0.0},
+        "days": {},                    # 每天离电秒数，用于周对比
         "first_seen": str(date.today()),
     }
 
@@ -443,6 +509,49 @@ def load_stats():
     if (st.get("today") or {}).get("date") != str(date.today()):
         st["today"] = {"date": str(date.today()), "kwh": 0.0, "wear": 0.0}
     return st
+
+
+MAX_HISTORY_DAYS = 21
+
+
+def record_on_battery(stats, seconds, today=None):
+    """把「离电秒数」记到当天，并只保留最近 21 天。
+
+    账本原来只会算钱，从不告诉用户「有没有变好」。记时长是为了做周对比。
+    """
+    if seconds is None or seconds <= 0:
+        return stats
+    today = today or date.today()
+    days = stats.setdefault("days", {})
+    key = str(today)
+    days[key] = round(float(days.get(key, 0.0)) + float(seconds), 1)
+    if len(days) > MAX_HISTORY_DAYS:
+        for old in sorted(days)[:-MAX_HISTORY_DAYS]:
+            days.pop(old, None)
+    return stats
+
+
+def weekly_on_battery(stats, today=None):
+    """返回 (本周秒数, 上周秒数)。本周 = 最近 7 天（含今天），上周 = 再往前 7 天。"""
+    today = today or date.today()
+    days = stats.get("days") or {}
+    this_w = last_w = 0.0
+    for i in range(14):
+        s = float(days.get(str(today - timedelta(days=i)), 0.0))
+        if i < 7:
+            this_w += s
+        else:
+            last_w += s
+    return this_w, last_w
+
+
+def fmt_hours(seconds):
+    """秒数 → 「3.2 小时」/「40 分钟」/「—」。"""
+    if not seconds or seconds <= 0:
+        return "—"
+    if seconds < 3600:
+        return f"{int(round(seconds / 60))} 分钟"
+    return f"{seconds / 3600.0:.1f} 小时"
 
 
 def advance_streak(stats, today=None):
@@ -560,6 +669,15 @@ def set_autostart(on):
 def log(msg):
     try:
         _ensure_dirs()
+        # 轮转：开机自启之后这个文件是长期 append 的，不切会一直涨
+        try:
+            if os.path.getsize(LOG_PATH) > 1_000_000:
+                bak = LOG_PATH + ".1"
+                if os.path.exists(bak):
+                    os.remove(bak)
+                os.replace(LOG_PATH, bak)
+        except OSError:
+            pass
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
     except Exception:
@@ -761,6 +879,12 @@ class App:
         # 下一个 tick 又满足 failsafe_win is None → 重开 → 再响一声，
         # 变成「每 65 秒响一次、关不掉」的无限循环。
         self._hibernate_failed = False
+        self._last_tick = time.time()
+
+        # 账本默认 60Wh 只是占位符，和真机容量能差 40%。第一次跑时后台读一下
+        # 本机真实容量——放线程里，别让 2 秒的 powercfg 卡住启动。
+        if not self.demo and abs(float(self.cfg.get("capacity_wh", 0)) - 60.0) < 1e-6:
+            threading.Thread(target=self._autofill_capacity, daemon=True).start()
 
         # 吸附 / 收起状态
         self.dock_edge = cfg.get("dock_edge", "right")
@@ -1094,6 +1218,20 @@ class App:
         if not set_autostart(want):
             self.autostart_var.set(autostart_enabled())
 
+    def _autofill_capacity(self):
+        """后台读本机电池容量，写进 cfg。
+
+        只改内存里的 cfg，不在这里落盘——落盘交给 quit() / 拖动时的 _save_cfg，
+        避免和 tick 的 stats 写入抢同一个文件。
+        """
+        try:
+            wh = read_battery_capacity_wh()
+        except Exception:
+            wh = None
+        if wh:
+            self.cfg["capacity_wh"] = wh
+            log(f"已自动读取本机电池容量 {wh} Wh（默认值是 60 Wh）")
+
     def _morning_menu_state(self):
         """「安静到明早」在低电量时应置灰。
 
@@ -1337,8 +1475,14 @@ class App:
         self.power = p
 
         now = time.time()
+        # 离电时长按两次 tick 的间隔累加。上限 60 秒是为了防止
+        # 休眠/挂起之后醒来，把几小时一口气算进今天。
+        dt = min(60.0, max(0.0, now - self._last_tick))
+        self._last_tick = now
         self.rate.add(now, p["pct"], p["ac"])
         self.ledger.tick(p["pct"], p["ac"])
+        if not self.demo and not p["ac"] and p["pct"] is not None:
+            record_on_battery(self.stats, dt)
 
         self.level = level_for(p["pct"], p["ac"], self.cfg)
 
@@ -1812,6 +1956,17 @@ class App:
                  font=self.f_sm, anchor="w").pack(fill="x", pady=(self.px(12), 0))
         row("用电池省下的电费", f"¥{s['saved']:.2f}", C["green"])
         row("同时消耗的电池寿命", f"¥{s['cost']:.2f}", C["red"])
+
+        # 只算钱是不够的——还得告诉用户"有没有变好"
+        wk, lw = weekly_on_battery(self.stats)
+        tk.Label(rows, text="离电时长", bg=C["surface"], fg=C["faint"],
+                 font=self.f_sm, anchor="w").pack(fill="x", pady=(self.px(12), 0))
+        row("本周", fmt_hours(wk), C["text"])
+        row("上周", fmt_hours(lw), C["muted"])
+        if lw > 0 and wk > 0:
+            pct = (wk - lw) / lw * 100.0
+            row("变化", f"{'↓' if pct < 0 else '↑'}{abs(pct):.0f}%",
+                C["green"] if pct < 0 else C["red"])
 
         if s["ratio"] and s["ratio"] > 0:
             line = f"你省下的每 1 元电费，对应约 {s['ratio']:.0f} 元的电池折损。"
@@ -2360,6 +2515,53 @@ def self_test():
             sys.modules.pop("winreg", None)
         else:
             sys.modules["winreg"] = _saved_reg
+
+    # 电池容量解析：本机 92.0/84.1 Wh，默认的 60 Wh 会让账本系统性偏低 40%
+    _xml = ("<BatteryReport><Battery><DesignCapacity>92041</DesignCapacity>"
+            "<FullChargeCapacity>84065</FullChargeCapacity></Battery></BatteryReport>")
+    assert abs(_capacity_from_report_xml(_xml) - 84.1) < 0.15, \
+        _capacity_from_report_xml(_xml)
+    assert abs(_capacity_from_report_xml(
+        "<a><DesignCapacity>60000</DesignCapacity></a>") - 60.0) < 0.15, \
+        "没有 FullChargeCapacity 时应退回设计容量"
+    assert abs(_capacity_from_report_xml(
+        '<a xmlns="http://x"><FullChargeCapacity>50000</FullChargeCapacity></a>')
+        - 50.0) < 0.15, "带命名空间也要能解析"
+    assert _capacity_from_report_xml("not xml") is None
+    assert _capacity_from_report_xml(
+        "<a><FullChargeCapacity>0</FullChargeCapacity></a>") is None, "0 应视为无效"
+    assert _capacity_from_report_xml(
+        "<a><FullChargeCapacity>999999</FullChargeCapacity></a>") is None, "离谱值应丢弃"
+
+    # 离电时长与周对比
+    _d = date(2026, 10, 31)
+    st = {}
+    record_on_battery(st, 3600, _d)
+    record_on_battery(st, 1800, _d)
+    assert abs(st["days"][str(_d)] - 5400) < 0.01, st
+    record_on_battery(st, 0, _d)
+    record_on_battery(st, -5, _d)
+    assert abs(st["days"][str(_d)] - 5400) < 0.01, "0 或负数不该改变结果"
+
+    st2 = {"days": {str(_d): 3600, str(_d - timedelta(days=8)): 7200}}
+    wk, lw = weekly_on_battery(st2, _d)
+    assert abs(wk - 3600) < 0.01 and abs(lw - 7200) < 0.01, (wk, lw)
+
+    st3 = {}
+    for i in range(30):
+        record_on_battery(st3, 60, _d - timedelta(days=i))
+    assert len(st3["days"]) == MAX_HISTORY_DAYS, f"应只保留 {MAX_HISTORY_DAYS} 天"
+
+    assert fmt_hours(0) == "—"
+    assert fmt_hours(1800) == "30 分钟", fmt_hours(1800)
+    assert fmt_hours(7200) == "2.0 小时", fmt_hours(7200)
+
+    # 日志轮转：开机自启之后这个文件是长期 append 的
+    with open(LOG_PATH, "w", encoding="utf-8") as _f:
+        _f.write("x" * 1_000_100)
+    log("轮转测试")
+    assert os.path.exists(LOG_PATH + ".1"), "超过 1MB 应轮转出 .1"
+    assert os.path.getsize(LOG_PATH) < 10_000, "轮转后新日志应很小"
 
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {
