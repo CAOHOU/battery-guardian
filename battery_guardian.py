@@ -110,7 +110,7 @@ DEFAULTS = {
     "enable_cost_layer": False,
     "enable_fail_safe": True,
     "fail_safe_countdown": 60,
-    "dialog_regrow_seconds": 60,
+    "dialog_regrow_seconds": 30,
     "poll_seconds": 5,
     "hud_pos": None,
     "dock_edge": "right",
@@ -522,7 +522,7 @@ def _sanitize_config(cfg):
         # 下限 1 秒：0 会让 after(0) 变成忙等，CPU 直接跑满
         cfg["poll_seconds"] = _as_num(cfg.get("poll_seconds"), 5.0, 1.0, 600.0)
         cfg["fail_safe_countdown"] = int(_as_num(cfg.get("fail_safe_countdown"), 60, 5, 600))
-        cfg["dialog_regrow_seconds"] = _as_num(cfg.get("dialog_regrow_seconds"), 60.0, 5.0, 3600.0)
+        cfg["dialog_regrow_seconds"] = _as_num(cfg.get("dialog_regrow_seconds"), 30.0, 5.0, 3600.0)
         cfg["collapse_lock_below"] = int(_as_num(cfg.get("collapse_lock_below"), 30, 0, 100))
         cfg["enable_cost_layer"] = _as_bool(cfg.get("enable_cost_layer"), False)
         cfg["enable_fail_safe"] = _as_bool(cfg.get("enable_fail_safe"), True)
@@ -2026,7 +2026,8 @@ class App:
         for child in self.dialog.winfo_children():
             child.destroy()
 
-        extra = self.px(30) * self.dialog_grow
+        # 每档 45px（原 30px）：用户反馈「没感觉变大」，30px 在 408px 宽度上只有 7%
+        extra = self.px(45) * self.dialog_grow
         inner_w = self.px(360) + extra
         pad_x, pad_y = self.px(24), self.px(20) + self.px(8) * self.dialog_grow
 
@@ -2129,7 +2130,7 @@ class App:
             # 这条日志是为了回答「它到底放大了没有」。原来 _push_dialog 不留痕，
             # 用户说「没感觉变大」时，日志里查不到任何证据。
             log(f"确认框放大到第 {self.dialog_grow} 档"
-                f"（宽 +{30 * self.dialog_grow}px）")
+                f"（宽 +{45 * self.dialog_grow}px）")
             self._render_dialog()
         else:
             self._shake()

@@ -390,7 +390,7 @@ def run_force_expand(root):
 def run_dialog_grow(root):
     """「没插电的话，这个窗口会再大一圈」——这个承诺必须真的兑现。
 
-    实测：408 → 438 → 468 → 498（每档 +30px），第 4 次封顶改抖动。
+    实测：408 → 453 → 498 → 543（每档 +45px），第 4 次封顶改抖动。
 
     这条原来零覆盖。用户反馈「好像没感觉会变大」时，代码里没有任何证据
     能回答这个问题——只能靠人去量。现在不用了。
@@ -410,7 +410,7 @@ def run_dialog_grow(root):
         widths.append(app.dialog.winfo_width())
 
     check("第一档确实变宽", widths[1] > widths[0], str(widths))
-    check("三档累计至少宽 60px", widths[3] - widths[0] >= 60,
+    check("三档累计至少宽 120px", widths[3] - widths[0] >= 120,
           f"{widths[0]} → {widths[3]}")
     check("到第 3 档封顶", app.dialog_grow == 3, str(app.dialog_grow))
 
