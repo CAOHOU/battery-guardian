@@ -110,6 +110,10 @@ DEFAULTS = {
     "dock_edge": "right",
     "pinned": False,
     "collapse_lock_below": 30,
+    # 提示音：只在"需要你真的做点什么"的两档响，别的地方保持安静
+    "sound_enabled": True,
+    "sound_on_dialog": True,       # L3 确认框弹出时
+    "sound_on_failsafe": True,     # L6 休眠倒计时弹出时
 }
 
 
@@ -144,6 +148,15 @@ def _clean_secs(secs):
     if secs <= 0 or secs > 48 * 3600:
         return None
     return secs
+
+
+def _ac_from_status(v):
+    """ACLineStatus：1 = 已接电，0 = 未接电，255 = 未知。
+
+    `== 1` 改成 `!= 1` 会让插电状态整个反过来——但没有任何测试会红，
+    因为测试从不经过 read_power。抽出来单独喂值。
+    """
+    return v == 1
 
 
 def _charging_from_flag(flag, has_battery):
@@ -191,7 +204,7 @@ def read_power():
     secs = _secs_from_raw(st.BatteryLifeTime)
 
     return {
-        "ac": st.ACLineStatus == 1,
+        "ac": _ac_from_status(st.ACLineStatus),
         "pct": pct,
         "secs": secs,
         "charging": _charging_from_flag(st.BatteryFlag, has_battery),
@@ -381,6 +394,9 @@ def _sanitize_config(cfg):
         # pinned 是唯一漏净化的下游字段：手写 "false" 会被 bool() 当成 True，
         # 浮条从此永远不收起，而且没有任何提示。
         cfg["pinned"] = _as_bool(cfg.get("pinned"), False)
+        cfg["sound_enabled"] = _as_bool(cfg.get("sound_enabled"), True)
+        cfg["sound_on_dialog"] = _as_bool(cfg.get("sound_on_dialog"), True)
+        cfg["sound_on_failsafe"] = _as_bool(cfg.get("sound_on_failsafe"), True)
 
         if cfg.get("dock_edge") not in (None, "left", "right"):
             cfg["dock_edge"] = "right"
@@ -447,6 +463,29 @@ def advance_streak(stats, today=None):
             stats["streak_days"] = 1
     stats["last_clean_date"] = today_s
     return stats
+
+
+# 只在两个"必须做点什么"的档位响，其余保持安静：
+# 到处响等于没响，跟一开始那个被忽略的系统弹窗是一个道理。
+SOUND_ALIASES = {
+    "dialog": "SystemExclamation",   # 该插电了
+    "failsafe": "SystemHand",        # 即将休眠，最急
+}
+
+
+def play_alert(kind):
+    """播一声系统提示音，异步、失败静默。
+
+    不能阻塞 UI（PlaySound 用 SND_ASYNC），也不能因为没声卡/非 Windows
+    把主流程带崩——提示音是增强，不是依赖。
+    """
+    try:
+        import winsound
+        alias = SOUND_ALIASES.get(kind, "SystemAsterisk")
+        winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC)
+        return True
+    except Exception:
+        return False
 
 
 def log(msg):
@@ -1263,6 +1302,20 @@ class App:
 
     # ------------------------------------------------------------ 说谎检测对话框
 
+    def _alert(self, kind):
+        """按配置决定要不要响。
+
+        静音（mute）不挡保底层的提示音，跟 L6 本身不受静音影响保持一致：
+        静音是"别烦我"，不是"别提醒我要关机了"。
+        """
+        if not self.cfg.get("sound_enabled", True):
+            return False
+        if kind == "dialog" and not self.cfg.get("sound_on_dialog", True):
+            return False
+        if kind == "failsafe" and not self.cfg.get("sound_on_failsafe", True):
+            return False
+        return play_alert(kind)
+
     def _open_dialog(self):
         self.dialog = tk.Toplevel(self.root)
         self.dialog.title("该插电了")
@@ -1280,6 +1333,7 @@ class App:
         self.dialog.focus_force()
         self.dialog_ignored += 1
         log(f"打开确认框 pct={self.power['pct']} 第 {self.dialog_ignored} 次")
+        self._alert("dialog")
 
     def _render_dialog(self):
         for child in self.dialog.winfo_children():
@@ -1456,6 +1510,7 @@ class App:
                  wraplength=self.px(320)).pack(fill="x", pady=(self.px(10), 0))
 
         self._fit(self.failsafe_win, wrap, pad_x, pad_y, self.px(340))
+        self._alert("failsafe")
         self._fs_tick()
 
     def _fs_tick(self):
@@ -1913,6 +1968,53 @@ def self_test():
     assert level_for(8, False, cfg) == "fail_safe", "8% 必须触发保底层"
     assert level_for(9, False, cfg) != "fail_safe", "9% 不该触发保底层"
     assert level_for(20, False, cfg) == "dialog", "20% 必须触发确认框"
+
+    # 插电时必须直接返回 ac，不能被阈值逻辑吞掉（or 改成 and 会让插电也走档位判断）
+    assert level_for(50, True, cfg) == "ac", "插电时不论电量都应为 ac"
+    assert level_for(None, True, cfg) == "ac"
+    assert level_for(None, False, cfg) == "calm"
+
+    # AC 状态解析：== 改成 != 会让插电整个反过来
+    assert _ac_from_status(1) is True
+    assert _ac_from_status(0) is False
+    assert _ac_from_status(255) is False, "未知不能当成已接电"
+
+    # _can_collapse 的两个前置分支（return False 改成 True 会让危险档位也能藏）
+    def _cc(dock="right", pinned=False, ac=True):
+        return type("C", (), {
+            "dock_edge": dock, "pinned": pinned,
+            "dialog": None, "failsafe_win": None, "banner": None,
+            "power": {"ac": ac, "pct": 90},
+            "cfg": cfg,
+        })()
+    assert App._can_collapse(_cc(dock=None)) is False, "未停靠必须禁止收起"
+    assert App._can_collapse(_cc(pinned=True)) is False, "固定后必须禁止收起"
+    assert App._can_collapse(_cc()) is True, "正常情况应允许收起"
+
+    # 提示音：三个开关必须真的生效，且关掉确认框提示音不能连带关掉保底层
+    _calls = []
+    _orig_play = globals()["play_alert"]
+    globals()["play_alert"] = lambda k: _calls.append(k) or True
+    try:
+        def _snd(**kw):
+            return type("S", (), {"cfg": kw})()
+
+        App._alert(_snd(sound_enabled=True, sound_on_dialog=True,
+                        sound_on_failsafe=True), "dialog")
+        assert _calls == ["dialog"], _calls
+
+        App._alert(_snd(sound_enabled=False), "dialog")
+        assert _calls == ["dialog"], "总开关关掉后不应再响"
+
+        App._alert(_snd(sound_enabled=True, sound_on_dialog=False,
+                        sound_on_failsafe=True), "dialog")
+        assert _calls == ["dialog"], "单独关掉确认框提示音后不应响"
+
+        App._alert(_snd(sound_enabled=True, sound_on_dialog=False,
+                        sound_on_failsafe=True), "failsafe")
+        assert _calls == ["dialog", "failsafe"], "关掉确认框提示音不应连带关掉保底层"
+    finally:
+        globals()["play_alert"] = _orig_play
 
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {

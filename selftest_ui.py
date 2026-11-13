@@ -20,6 +20,7 @@ ctypes.windll.shcore.SetProcessDpiAwareness(1)
 import battery_guardian as bg
 
 FAILS = []
+SOUNDS = []          # 收集 play_alert 的调用，测试期间不真的响
 
 
 def pump(root, sec=0.7):
@@ -385,6 +386,40 @@ def run_demo_no_persist():
     check("退出后也没写 config.json", not os.path.exists(bg.CFG_PATH))
 
 
+def run_sound(root):
+    """提示音：确认框弹出时响一次；静音之后不再响。
+
+    保底层那一声没有在 UI 层测——那需要把 demo 关掉再开真保底层，
+    而倒计时到 0 会真的休眠这台机器。它的开关逻辑在 --self-test 里覆盖。
+    """
+    stage("提示音")
+
+    del SOUNDS[:]
+    app = make_app(root, 15, "right")
+    pump(root, 0.5)
+    check("确认框弹出时响一次", SOUNDS.count("dialog") == 1, str(SOUNDS))
+
+    # 静音：不弹框，也就不该响
+    del SOUNDS[:]
+    app.mute(30)
+    app.tick()
+    pump(root, 0.3)
+    check("静音后不再响确认音", SOUNDS == [], str(SOUNDS))
+
+    # 关掉总开关：即使弹框也不响
+    del SOUNDS[:]
+    app.muted_until = 0
+    app.cfg["sound_enabled"] = False
+    app._close_dialog()
+    app.tick()
+    pump(root, 0.3)
+    check("总开关关掉后不响", SOUNDS == [], str(SOUNDS))
+    app.cfg["sound_enabled"] = True
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def main():
     # 测试写到临时目录，绝不能碰用户真实的 config / stats
     tmp = tempfile.mkdtemp(prefix="bg-test-")
@@ -392,6 +427,9 @@ def main():
     bg.CFG_PATH = os.path.join(tmp, "config.json")
     bg.STATS_PATH = os.path.join(tmp, "stats.json")
     bg.LOG_PATH = os.path.join(tmp, "app.log")
+
+    # 测试期间不要真的响（会打断人，也会拖慢）
+    bg.play_alert = lambda k: SOUNDS.append(k) or True
 
     print("=" * 60)
     print("界面冒烟测试")
@@ -416,6 +454,7 @@ def main():
     run_fit(root)
     run_slide_frames(root)
     run_force_expand(root)
+    run_sound(root)
     run_demo_no_persist()
 
     root.destroy()

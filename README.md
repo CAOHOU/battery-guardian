@@ -77,6 +77,28 @@
 
 ---
 
+## 提示音
+
+只在两个**需要你真的做点什么**的档位响，其余保持安静：
+
+| 时机 | 音色 | 说明 |
+|---|---|---|
+| L3 确认框弹出 | `SystemExclamation` | 20%，该插电了 |
+| L6 休眠倒计时弹出 | `SystemHand` | 8%，更急 |
+
+设计上的三条约束：
+
+- **不到处响。** 到处响等于没响，跟一开始那个被忽略的系统弹窗是同一个道理。
+  所以 L1/L2 只改配色和文案，一声不出。
+- **异步播放**（`SND_ASYNC`），不阻塞界面；没声卡或非 Windows 时静默跳过，
+  提示音是增强，不是依赖。
+- **静音挡不住保底层那一声。** 跟 L6 本身不受静音影响保持一致：
+  静音是"别烦我"，不是"别提醒我要关机了"。
+
+三个开关：`sound_enabled`（总）、`sound_on_dialog`、`sound_on_failsafe`。
+
+---
+
 ## 运行方式
 
 ### 方式一：源码（推荐自己用）
@@ -262,6 +284,9 @@ gh release create v1.0.0 dist/BatteryGuardian.exe \
 | `collapse_lock_below` | `30` | 低于此电量强制展开，不允许收起 |
 | `enable_cost_layer` | `false` | L4 横幅，默认关。它有效但很烦 |
 | `enable_fail_safe` | `true` | L6 自动休眠 |
+| `sound_enabled` | `true` | 提示音总开关 |
+| `sound_on_dialog` | `true` | L3 确认框弹出时响一声 |
+| `sound_on_failsafe` | `true` | L6 休眠倒计时弹出时响一声（更急的音色） |
 | `fail_safe_countdown` | `60` | 休眠倒计时秒数 |
 | `dialog_regrow_seconds` | `60` | 对话框被无视后多久再放大一次 |
 | `poll_seconds` | `5` | 电量轮询间隔 |
