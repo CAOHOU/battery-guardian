@@ -23,6 +23,7 @@ import ctypes
 import io
 import json
 import os
+import re
 import sys
 import time
 import subprocess
@@ -154,30 +155,36 @@ def _clean_secs(secs):
     return secs
 
 
+_CAP_TAG_RE = {
+    "FullChargeCapacity": re.compile(
+        r"<FullChargeCapacity>\s*([0-9]+(?:\.[0-9]+)?)\s*</FullChargeCapacity>"),
+    "DesignCapacity": re.compile(
+        r"<DesignCapacity>\s*([0-9]+(?:\.[0-9]+)?)\s*</DesignCapacity>"),
+}
+
+
 def _capacity_from_report_xml(xml_text):
     """从 powercfg batteryreport 的 XML 里取电池容量（Wh）。
 
     优先 FullChargeCapacity（当前实际满充），退回 DesignCapacity（出厂设计）。
     账本算的是「这次放电实际放出多少电」，所以当前值更贴切。
-    抽成纯函数是为了能喂固定文本测，不用真跑 powercfg。
+
+    这里刻意**不用 xml.etree**：构建脚本为了减体积排除了整个 xml 包，
+    在 exe 里 import 它会失败（而且实测会卡住自检）。字段就两个数字，
+    正则足够，还省掉一个依赖。
     """
-    import xml.etree.ElementTree as ET
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    if not xml_text:
         return None
 
     def pick(tag):
-        for el in root.iter():
-            if el.tag.split("}")[-1] != tag or not el.text:
-                continue
-            try:
-                v = float(el.text)
-            except ValueError:
-                continue
-            if v > 0:
-                return v
-        return None
+        m = _CAP_TAG_RE[tag].search(xml_text)
+        if not m:
+            return None
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            return None
+        return v if v > 0 else None
 
     mwh = pick("FullChargeCapacity") or pick("DesignCapacity")
     if not mwh:
@@ -2525,8 +2532,8 @@ def self_test():
         "<a><DesignCapacity>60000</DesignCapacity></a>") - 60.0) < 0.15, \
         "没有 FullChargeCapacity 时应退回设计容量"
     assert abs(_capacity_from_report_xml(
-        '<a xmlns="http://x"><FullChargeCapacity>50000</FullChargeCapacity></a>')
-        - 50.0) < 0.15, "带命名空间也要能解析"
+        "<a><FullChargeCapacity> 50000 </FullChargeCapacity></a>") - 50.0) < 0.15, \
+        "标签里的空白要能容忍"
     assert _capacity_from_report_xml("not xml") is None
     assert _capacity_from_report_xml(
         "<a><FullChargeCapacity>0</FullChargeCapacity></a>") is None, "0 应视为无效"

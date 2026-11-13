@@ -96,5 +96,17 @@ rem 排除不用的模块：ssl/_hashlib 会带进 libcrypto(约 5MB) + libssl(�
 if errorlevel 1 echo [ERROR] Build failed. & "%SystemRoot%\System32\timeout.exe" /t 8 >nul 2>nul & exit /b 1
 
 echo.
+echo [5/5] Verifying exe ...
+rem 排除模块后如果代码里 import 了它们，exe 会卡死而不是报错，
+rem 所以每次打包都真跑一次 --self-test，超时即失败。
+"%PY%" verify_exe.py
+if errorlevel 1 (
+  echo.
+  echo [ERROR] exe verification failed.
+  pause
+  exit /b 1
+)
+
+echo.
 echo Done.  dist\BatteryGuardian.exe
 echo.
