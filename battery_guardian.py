@@ -132,6 +132,20 @@ UNKNOWN = 255
 NO_TIME = 0xFFFFFFFF
 
 
+def _clean_secs(secs):
+    """清洗 BatteryLifeTime：0 / 负数 / 超过 48 小时都当未知。
+
+    超过 48 小时基本是驱动在瞎报哨兵值，显示出来就是"还能撑 30 天"，
+    比不显示更糟。抽成函数是为了能直接测——原来这段夹在 read_power 里，
+    随机变异测试发现把 `secs is not None` 改成 `is None` 没有任何测试会红。
+    """
+    if secs is None:
+        return None
+    if secs <= 0 or secs > 48 * 3600:
+        return None
+    return secs
+
+
 def read_power():
     """返回 {ac, pct, secs, charging, has_battery}，读不到返回 None。"""
     st = _SYSTEM_POWER_STATUS()
@@ -146,8 +160,7 @@ def read_power():
         pct = None                                     # 防御：越界一律当未知
 
     secs = None if st.BatteryLifeTime == NO_TIME else int(st.BatteryLifeTime)
-    if secs is not None and (secs <= 0 or secs > 48 * 3600):
-        secs = None
+    secs = _clean_secs(secs)
 
     return {
         "ac": st.ACLineStatus == 1,
@@ -1838,6 +1851,35 @@ def self_test():
     sysonly = _est({"ac": False, "pct": 43, "secs": 600}, [])
     lo, hi, src = App.estimate(sysonly)
     assert src == "system" and abs(lo - 10.0) < 1e-6, f"应退回系统估值，实际 {src} {lo}"
+
+    # 随机变异抽样发现的盲区：把 `secs is not None` 改成 `is None`，
+    # 哨兵值（0 / 负数 / 超过 48 小时）就会原样显示成"还能撑 30 天"。
+    assert _clean_secs(None) is None
+    assert _clean_secs(0) is None, "0 秒应视为未知"
+    assert _clean_secs(-1) is None, "负数应视为未知"
+    assert _clean_secs(48 * 3600 + 1) is None, "超过 48 小时应视为未知"
+    assert _clean_secs(3600) == 3600, "正常值应原样保留"
+    assert _clean_secs(48 * 3600) == 48 * 3600, "边界值应保留"
+
+    # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
+    lg_today = Ledger(default_config(), {
+        "kwh": 0.0, "wear": 0.0,
+        "today": {"date": str(date.today()), "kwh": 10.0, "wear": 10.0},
+    })
+    s_today = lg_today.summary()
+    assert s_today["today_saved"] > 0, "当天数据必须计入 today_saved"
+    assert s_today["today_cost"] > 0, "当天数据必须计入 today_cost"
+
+    # has_battery 缺省时要按"有电池"处理，否则笔记本被当成台式机、永远显示"未接电"
+    nb = type("S", (), {
+        "power": {"ac": False, "pct": 80, "secs": None},
+        "stats": {"streak_days": 0},
+        "rate": RateEstimator(),
+        "level": "calm",
+        "estimate": App.estimate,
+    })()
+    assert App.sub_text(nb) != "未接电", \
+        f"缺 has_battery 时不应判为无电池，实际 {App.sub_text(nb)}"
 
     print("自检：等级判定、速率估算、区间文案、台式机无电池、配置净化、"
           "阈值顺序、静音不关保底层、连续天数、明早时长、账本全部通过")

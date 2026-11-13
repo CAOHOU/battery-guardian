@@ -92,6 +92,9 @@ def run(root, pct, dock, expect_collapse=True):
     check("贴边无缝隙", edge_gap(app) == 0, f"gap={edge_gap(app)}")
     check("初始为展开", not app.collapsed)
     check("宽度为完整宽度", app.hud_w > app.px(150), f"w={app.hud_w}")
+    # 随机变异抽样发现的盲区：初始值被改成 True 会跳过整个断电计数
+    check("初始未标记断电", app._incident_flag is False)
+    check("浮条置顶", bool(app.hud.attributes("-topmost")))
 
     stage("收起")
     can = app._can_collapse()
@@ -128,6 +131,20 @@ def run(root, pct, dock, expect_collapse=True):
         check("固定后禁止收起", not app._can_collapse())
     app._on_click()
     pump(root, 0.3)
+
+    stage("拖动")
+    class _E:
+        x_root = 600
+        y_root = 300
+    app._drag_start(_E())
+    check("拖动开始时清空标记", app._dragged is False)
+    app._drag_move(_E())
+    # 随机变异抽样发现的盲区：把 `if not self._dragged` 的 not 去掉，
+    # 整段（标记 + 解除停靠）都被跳过，拖了等于没拖
+    check("拖动后标记为已拖动", app._dragged is True)
+    check("拖动后解除停靠", app.dock_edge is None, f"dock={app.dock_edge}")
+    app._drag_end(_E())
+    pump(root, 0.2)
 
     stage("拖离边缘 → 解除停靠")
     app._dragged = True
@@ -185,6 +202,8 @@ def run_hover(root):
 
     check("命中浮条内部", app._pointer_over(cx, cy))
     check("容差内仍算悬停", app._pointer_over(app.hud_x - tol + 1, cy), f"tol={tol}")
+    # 边界：正好等于容差边缘必须算命中（<= 改成 < 会漏掉这一圈）
+    check("容差边界算命中", app._pointer_over(app.hud_x - tol, cy), f"tol={tol}")
     check("超出容差不算悬停",
           not app._pointer_over(app.hud_x - tol - app.px(5), cy))
 
