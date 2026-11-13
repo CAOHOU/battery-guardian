@@ -371,6 +371,50 @@ def run_force_expand(root):
     pump(root, 0.2)
 
 
+def run_claim_logging(root):
+    """点「已插电」必须留痕——这是试用期复盘的唯一数据源。
+
+    没有这两行日志，三天后只能知道「弹了几次框」，不知道「点了之后到底插没插」，
+    也就无法回答这个工具的核心问题：提醒有没有让人真的去插电。
+    """
+    app = make_app(root, 15, "right")
+    pump(root, 0.5)
+    stage("已插电留痕")
+    check("前置：确认框已弹出", app.dialog is not None)
+
+    logs = []
+    orig_log = bg.log
+    orig_read = bg.read_power
+    orig_demo_pct = app.demo_pct
+    bg.log = lambda m: logs.append(m)
+    # demo_pct 不为空时 _on_claim_plugged 直接当「没插电」处理，
+    # 走不到 read_power。这里要测真实分支，必须先置空。
+    app.demo_pct = None
+    try:
+        # 没插电时点按钮 → 必须记「声称已插电但未检测到」
+        bg.read_power = lambda: {"ac": False, "pct": 15, "secs": None,
+                                 "charging": False, "has_battery": True}
+        app._on_claim_plugged()
+        pump(root, 0.2)
+        check("没插电时留痕",
+              any("声称已插电但未检测到" in m for m in logs), str(logs))
+
+        # 真插电 → 必须记「确认已插电」
+        logs.clear()
+        bg.read_power = lambda: {"ac": True, "pct": 15, "secs": None,
+                                 "charging": True, "has_battery": True}
+        app._on_claim_plugged()
+        pump(root, 0.2)
+        check("真插电时留痕", any("确认已插电" in m for m in logs), str(logs))
+    finally:
+        bg.log = orig_log
+        bg.read_power = orig_read
+        app.demo_pct = orig_demo_pct
+
+    teardown(app)
+    pump(root, 0.2)
+
+
 def run_tick_resilience(root):
     """tick() 里抛异常后，主循环必须还能继续跑。
 
@@ -746,6 +790,7 @@ def main():
     run_geometry_clamp(root)
     run_ledger(root)
     run_hibernate_failed(root)
+    run_claim_logging(root)
     run_tick_resilience(root)
     run_demo_no_persist()
 

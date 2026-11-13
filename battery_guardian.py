@@ -1867,15 +1867,21 @@ class App:
                 pass
 
     def _on_claim_plugged(self):
+        # 这两行日志是「试用期复盘」的唯一数据源：
+        # 点了按钮之后到底插没插，只有这里知道。没有它，事后无法回答
+        # 「提醒有没有让人真的去插电」——而那正是这个工具的全部主张。
+        pct = self.power.get("pct")
         if self.demo_pct is not None:
             p = {"ac": False}
         else:
             p = read_power()
         if p and p.get("ac"):
+            log(f"确认已插电 pct={pct}")
             self._close_dialog()
             self._mark_clean_day()
             self.render_hud()
             return
+        log(f"声称已插电但未检测到 pct={pct}")
         self._shake()
         try:
             self.tip.configure(text="检测到还没插电。插上电源后这个窗口会自己消失。",
@@ -2235,6 +2241,7 @@ class App:
 
     def quit(self):
         self._alive = False
+        log("程序退出（正常）")
         # 演示模式不写盘：否则截个图就把真实统计和窗口位置改掉了
         if not self.demo:
             _save_json(STATS_PATH, self.stats)
@@ -3139,6 +3146,8 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
+    # 启动标记放 App 之前：万一 App 初始化就崩了，也能看出「启动了但没起来」
+    log(f"程序启动 v{__version__} pid={os.getpid()}")
     app = App(root, load_config(), load_stats(), demo_pct=demo_pct)
     dispatch_panel(app, panel, root)
     root.mainloop()
