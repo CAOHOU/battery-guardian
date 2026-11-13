@@ -636,6 +636,15 @@ def run_measured_prefix(root):
         check("系统值不带前缀", not txt2.startswith("实测"), txt2)
         check("系统值格式是「X 小时 X 分钟」",
               "小时" in txt2 and "分钟" in txt2, txt2)
+
+        # 估算不可信时必须直说，不能给个漂亮数字。
+        # 极端情况：100% 电量 + 刚过下限的速率，外推出来「33 小时 20 分钟」。
+        app.estimate = lambda: (1940.0, 2000.0, "unreliable")
+        txt3 = app.sub_text()
+        check("不可靠的估算显示「估算不可靠」", txt3 == "估算不可靠", txt3)
+        check("不可靠时不显示具体时长", "小时" not in txt3, txt3)
+        check("minutes_left 不把不可靠值外传",
+              app.minutes_left() is None, str(app.minutes_left()))
     finally:
         app.estimate = orig
 

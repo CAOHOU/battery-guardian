@@ -946,6 +946,11 @@ RATE_MIN_SPAN_S = 300  # 至少观察 5 分钟
 RATE_SHORT_MIN_DROP = 2.0
 RATE_LONG_MIN_DROP = 3.0
 
+# 实测估算的上限。超过这个值不再显示具体时长，改说「估算不可靠」。
+# 24 小时：笔记本电池物理上撑不到一天，超过它必然是「只掉了 1% 就外推」
+# 或者「窗口内几乎空载」造成的假精度。系统值不受此限（见 estimate()）。
+MEASURED_MAX_MIN = 24 * 60
+
 # 鼠标离开浮条多久之后自动收起。抽成常量是为了测试能直接引用它，
 # 而不是在测试里也写一个 1.5——那样改坏代码测试会跟着一起错。
 HOVER_COLLAPSE_DELAY_S = 1.5
@@ -1771,6 +1776,10 @@ class App:
         lo, hi, src = self.estimate()
         if lo is None:
             return "估算中"
+        # 有数但不可信时，说实话比给个漂亮数字有用。
+        # 显示「实测约 33 小时 20 分钟」等于把量化噪声包装成结论。
+        if src == "unreliable":
+            return "估算不可靠"
         txt = self.fmt_duration(lo, hi)
         # 系统值是主路径，不用标；自己测的反而是兜底，标出来让人知道这个数更粗
         return ("实测" + txt) if src == "measured" else txt
@@ -1809,6 +1818,14 @@ class App:
                  if r and r > 0]
         if rates:
             ts = sorted(pct / r for r in rates)
+            # 上限只卡**实测**这一路，不卡系统值。
+            # 理由：系统值是驱动算的，有真实毫瓦时做依据，而且 _clean_secs
+            # 已经把它限制在 48 小时内；实测是整数百分比外推，噪声大得多。
+            # 100% 电量、速率刚过下限 0.05%/min 时，外推出来是 2000 分钟
+            # ——浮条写「实测约 33 小时 20 分钟」，用户会以为这数可信。
+            # 笔记本电池物理上撑不到一天，超过 24 小时一定是假精度。
+            if ts[-1] > MEASURED_MAX_MIN:
+                return ts[0], ts[-1], "unreliable"
             return ts[0], ts[-1], "measured"
         return None, None, None
 
@@ -1844,8 +1861,9 @@ class App:
         return f"约 {h} 小时 {m} 分钟"
 
     def minutes_left(self):
-        lo, hi, _ = self.estimate()
-        if lo is None:
+        lo, hi, src = self.estimate()
+        # 不可信的估算不要外传：调用方拿它去算倒计时/文案，会跟着一起荒谬
+        if lo is None or src == "unreliable":
             return None
         return max(0, int(round((lo + hi) / 2)))
 
@@ -2854,6 +2872,22 @@ def _self_test_body():
     sysonly = _est({"ac": False, "pct": 43, "secs": 600}, [])
     lo, hi, src = App.estimate(sysonly)
     assert src == "system" and abs(lo - 10.0) < 1e-6, f"应退回系统估值，实际 {src} {lo}"
+
+    # 实测外推超过 24 小时时必须标「不可靠」，不能把量化噪声包装成结论。
+    # 构造：60 分钟掉 3%（正好压着 RATE_LONG_MIN_DROP 下限），
+    # 当前 97% → 97 / 0.05 = 1940 分钟 ≈ 32 小时。
+    far = _est({"ac": False, "pct": 97, "secs": None},
+               [(3600, 100), (0, 97)])
+    lo, hi, src = App.estimate(far)
+    assert src == "unreliable", f"超过 24 小时应判不可靠，实际 src={src} hi={hi}"
+    assert hi > MEASURED_MAX_MIN, f"构造本身要越过上限，实际 hi={hi}"
+
+    # 上限只卡实测，不卡系统值：驱动给的 30 小时是真实数据，不该被藏掉。
+    # 这条和上一条互为反向断言——只测一边的话，把上限加到系统分支上也能过。
+    sys30 = _est({"ac": False, "pct": 60, "secs": 30 * 3600}, [])
+    lo, hi, src = App.estimate(sys30)
+    assert src == "system" and abs(lo - 30 * 60) < 1e-6, \
+        f"系统值不该被实测上限影响，实际 src={src} lo={lo}"
 
     _stage("边界值")
     # 随机变异抽样发现的盲区：把 `secs is not None` 改成 `is None`，

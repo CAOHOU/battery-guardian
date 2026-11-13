@@ -193,7 +193,7 @@ gh release create v1.1 dist/BatteryGuardian.exe \
 **实测（本机）**
 
 - 源码运行：浮条四档状态（已接电 / 45% / 15% / 5%）、确认框、休眠倒计时、账本、L4 横幅
-- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **115 个断言调用点、实跑 210 项**，连续多轮全通过
+- 吸附收起：右吸附 / 左吸附 / 收起 / 展开 / 固定 / 拖离，`selftest_ui.py` **118 个断言调用点、实跑 213 项**，连续多轮全通过
   （两个数不一样：同一个 `check()` 会在多个电量档位里被重复执行，所以实跑条数多于代码里的调用点）
 - 自动收起：启动 5 秒宽限期后，鼠标不在浮条上会自行收成彩条
 - exe：`--where` / `--once` / `--self-test` 与 GUI 启动、自动收起、确认框、窗口图标
@@ -411,7 +411,7 @@ python selftest_verify.py
 ```
 battery-guardian/
   battery_guardian.py   全部逻辑，单文件
-  selftest_ui.py        界面冒烟测试（115 个断言调用点 / 实跑 210 项）
+  selftest_ui.py        界面冒烟测试（118 个断言调用点 / 实跑 213 项）
   selftest_layout.py    布局矩阵测试（12 种屏幕 × DPI）
   selftest_verify.py    打包验证不得碰真实数据
   verify_exe.py         打包后自动验证 exe（build_exe.bat 调用）
