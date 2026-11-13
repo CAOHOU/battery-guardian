@@ -146,6 +146,14 @@ def _clean_secs(secs):
     return secs
 
 
+def _charging_from_flag(flag, has_battery):
+    """充电中 = 标志位 8 且真的有电池。
+
+    没有电池的台式机也常置位 8，不乘 has_battery 就会显示"充电中"。
+    """
+    return bool(flag & 8) and has_battery
+
+
 def _clean_pct(pct):
     """电量百分比的越界防御：只接受 0-100 的整数，其余一律当未知。
 
@@ -186,7 +194,7 @@ def read_power():
         "ac": st.ACLineStatus == 1,
         "pct": pct,
         "secs": secs,
-        "charging": bool(st.BatteryFlag & 8) and has_battery,
+        "charging": _charging_from_flag(st.BatteryFlag, has_battery),
         "has_battery": has_battery,
     }
 
@@ -1895,6 +1903,16 @@ def self_test():
     assert _clean_pct(101) is None, "越界应视为未知"
     assert _clean_pct(-1) is None, "负数应视为未知"
     assert _clean_pct(None) is None
+
+    # 充电标志必须乘 has_battery：台式机常置位 8，否则会显示"充电中"
+    assert _charging_from_flag(8, True) is True
+    assert _charging_from_flag(8, False) is False, "无电池时不能显示充电中"
+    assert _charging_from_flag(0, True) is False
+
+    # 保底层边界：8% 必须正好触发（<= 改成 < 会让 8% 这一档漏掉）
+    assert level_for(8, False, cfg) == "fail_safe", "8% 必须触发保底层"
+    assert level_for(9, False, cfg) != "fail_safe", "9% 不该触发保底层"
+    assert level_for(20, False, cfg) == "dialog", "20% 必须触发确认框"
 
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {

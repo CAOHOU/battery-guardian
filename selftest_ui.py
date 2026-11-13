@@ -94,6 +94,7 @@ def run(root, pct, dock, expect_collapse=True):
     check("宽度为完整宽度", app.hud_w > app.px(150), f"w={app.hud_w}")
     # 随机变异抽样发现的盲区：初始值被改成 True 会跳过整个断电计数
     check("初始未标记断电", app._incident_flag is False)
+    check("ESC 长按初始未就绪", app.key_ok is True)
     check("浮条置顶", bool(app.hud.attributes("-topmost")))
 
     stage("收起")
