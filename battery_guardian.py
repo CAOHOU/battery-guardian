@@ -146,6 +146,19 @@ def _clean_secs(secs):
     return secs
 
 
+def _clean_pct(pct):
+    """电量百分比的越界防御：只接受 0-100 的整数，其余一律当未知。
+
+    抽出来是因为随机变异把这里的 `not` 去掉后，**所有正常电量都会变成 None**，
+    而没有任何测试会红——测试全都直接塞假的 power 字典，从不经过 read_power。
+    """
+    if pct is None:
+        return None
+    if not (0 <= pct <= 100):
+        return None
+    return int(pct)
+
+
 def _secs_from_raw(raw):
     """把 GetSystemPowerStatus 的原始 BatteryLifeTime 转成秒数或 None。
 
@@ -165,8 +178,7 @@ def read_power():
     pct = None if st.BatteryLifePercent == UNKNOWN else int(st.BatteryLifePercent)
     if not has_battery:
         pct = None                                     # 台式机：没有电量可言
-    if pct is not None and not (0 <= pct <= 100):
-        pct = None                                     # 防御：越界一律当未知
+    pct = _clean_pct(pct)                              # 防御：越界一律当未知
 
     secs = _secs_from_raw(st.BatteryLifeTime)
 
@@ -1874,6 +1886,15 @@ def self_test():
     assert _secs_from_raw(NO_TIME) is None, "0xFFFFFFFF 应视为未知"
     assert _secs_from_raw(3600) == 3600, "3600 秒应原样保留"
     assert _secs_from_raw(0) is None, "0 秒应视为未知"
+
+    # 电量越界防御：`not` 被去掉时所有正常电量都会变成 None，
+    # 而测试全都直接塞假 power 字典，从不经过 read_power，所以必须单独测这里
+    assert _clean_pct(50) == 50, "正常电量应原样保留"
+    assert _clean_pct(0) == 0, "0% 是合法值"
+    assert _clean_pct(100) == 100, "100% 是合法值"
+    assert _clean_pct(101) is None, "越界应视为未知"
+    assert _clean_pct(-1) is None, "负数应视为未知"
+    assert _clean_pct(None) is None
 
     # 账本里当天数据必须计入：`self.stats.get("today") or {}` 改成 and 会归零
     lg_today = Ledger(default_config(), {
